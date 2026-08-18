@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -74,6 +75,13 @@ func New(ctx context.Context, cfg *config.Config, logger *slog.Logger, version s
 		issuer:   authn.NewIssuer(cfg.JWTSecret, cfg.AccessTokenTTL),
 		registry: registry,
 		router:   proxy.NewRouter(st, registry, logger),
+	}
+
+	// Install the antigravity coding filter when one of block or rewrite modes
+	// is selected. "off" leaves the filter unset, so the router's hot path
+	// skips it entirely.
+	if filter := buildAntigravityFilter(cfg, logger); filter != nil {
+		a.router.SetAntigravityFilter(filter)
 	}
 
 	if err = a.bootstrapAdmin(ctx); err != nil {
@@ -313,4 +321,30 @@ func (a *App) refreshCatalog(ctx context.Context) {
 			attempt()
 		}
 	}
+}
+
+// buildAntigravityFilter constructs the antigravity coding filter from the
+// configuration the operator supplied via environment variables. Returning
+// nil when mode is "off" lets the caller short-circuit the filter entirely.
+// A malformed custom_mappings string is reported loudly at boot time: the
+// filter is still installed so the rest of the configuration is honoured, but
+// the operator sees a warning before any request is screened.
+func buildAntigravityFilter(cfg *config.Config, logger *slog.Logger) *proxy.AntigravityFilter {
+	mode := proxy.AntigravityFilterMode(cfg.AntigravityFilterMode)
+	if mode == proxy.AntigravityFilterOff || mode == "" {
+		return nil
+	}
+
+	var customMappings []proxy.AntigravityMapping
+	if strings.TrimSpace(cfg.AntigravityFilterCustomMappings) != "" {
+		parsed, err := proxy.ParseAntigravityCustomMappings(cfg.AntigravityFilterCustomMappings)
+		if err != nil {
+			logger.Error("antigravity filter: ignoring custom_mappings due to parse error",
+				"error", err, "raw", cfg.AntigravityFilterCustomMappings)
+		} else {
+			customMappings = parsed
+		}
+	}
+
+	return proxy.NewAntigravityFilter(mode, cfg.AntigravityFilterUseDefault, customMappings)
 }

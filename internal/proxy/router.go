@@ -34,6 +34,11 @@ type Router struct {
 	registry *provider.Registry
 	log      *slog.Logger
 
+	// antigravityFilter screens requests bound for the Antigravity upstream
+	// for non-Antigravity coding-client names inside the `system` field. It
+	// is nil when the filter is disabled, so the hot path pays nothing.
+	antigravityFilter *AntigravityFilter
+
 	executors map[model.Provider]executor
 }
 
@@ -56,6 +61,21 @@ func NewRouter(st *store.Store, registry *provider.Registry, logger *slog.Logger
 		r.executors[model.ProviderAntigravity] = newAntigravityExecutor(client, registry.Tokens(), vendor, logger)
 	}
 	return r
+}
+
+// SetAntigravityFilter installs a coding-client filter that screens requests
+// bound for the Antigravity upstream. Passing nil disables the filter; this
+// is the default, so existing callers that never call this method are
+// unaffected. The method is on Router (not the constructor) so that the
+// config layer can stay in charge of constructing the filter and the rest of
+// the binary keeps a single NewRouter entry point.
+func (r *Router) SetAntigravityFilter(filter *AntigravityFilter) {
+	r.antigravityFilter = filter
+	if filter == nil {
+		r.log.Info("antigravity coding filter disabled")
+	} else {
+		r.log.Info("antigravity coding filter enabled", "mode", filter.Mode())
+	}
 }
 
 // Call describes one proxied completion request.
@@ -117,6 +137,35 @@ func (r *Router) Complete(ctx context.Context, w http.ResponseWriter, call Call)
 		return r.fail(ctx, w, call, outcome, started, apiErr)
 	}
 	outcome.Provider = providerID
+
+	// The antigravity coding filter screens requests bound for the Antigravity
+	// upstream. It runs after provider resolution so the policy checks above
+	// (allowed providers, model allow list) take precedence, and before the
+	// request is dispatched so a blocked body never reaches the upstream.
+	// Rewrite mode may replace the body; the request is then re-parsed so the
+	// executor sees the rewritten instructions rather than the original ones.
+	if r.antigravityFilter != nil && providerID == model.ProviderAntigravity {
+		rewritten, decision := r.antigravityFilter.Apply(call.Body)
+		if decision.Blocked {
+			blockErr := newAPIError(http.StatusForbidden, "invalid_request_error",
+				"request blocked because it matches a configured non-Antigravity coding software keyword: "+
+					decision.Detail)
+			blockErr.Code = "blocked_by_antigravity_coding_filter"
+			return r.fail(ctx, w, call, outcome, started, blockErr)
+		}
+		if rewritten != nil {
+			call.Body = rewritten
+			if req2, perr := ParseRequest(call.Format, call.Body, ParseOptions{
+				Model:       call.PathModel,
+				ForceStream: call.ForceStream,
+			}); perr == nil {
+				req = req2
+			} else {
+				r.log.Warn("antigravity filter: rewritten body failed to re-parse; forwarding original",
+					"error", perr)
+			}
+		}
+	}
 
 	ex, ok := r.executors[providerID]
 	if !ok {

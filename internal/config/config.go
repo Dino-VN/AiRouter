@@ -66,6 +66,19 @@ type Config struct {
 	// X-Forwarded-For / X-Real-IP.
 	TrustProxyHeaders bool
 
+	// AntigravityFilterMode controls the coding-client filter applied to
+	// requests bound for the Antigravity upstream. Valid values are "off"
+	// (default, filter disabled), "block" (reject matching requests with HTTP
+	// 403), and "rewrite" (replace matched names with "Antigravity" and
+	// forward). See internal/proxy/antifilter.go for the matching logic.
+	AntigravityFilterMode string
+	// AntigravityFilterUseDefault toggles the built-in keyword preset.
+	AntigravityFilterUseDefault bool
+	// AntigravityFilterCustomMappings is the operator-supplied mapping
+	// expression: a comma- or newline-delimited "from: to" string, e.g.
+	// "Cursor: Antigravity\nWindsurf: Antigravity".
+	AntigravityFilterCustomMappings string
+
 	// generatedKeyPath records where an auto-generated encryption key was
 	// written, so main() can warn about it.
 	GeneratedKeyPath string
@@ -94,10 +107,26 @@ func Load() (*Config, error) {
 		EnableLocalOAuthListeners: envBool("AIHUB_LOCAL_OAUTH_LISTENERS", false),
 		UsageRetentionDays:        envInt("AIHUB_USAGE_RETENTION_DAYS", 90),
 		TrustProxyHeaders:         envBool("AIHUB_TRUST_PROXY_HEADERS", false),
+
+		// Antigravity coding filter. Defaults to "off" so existing deployments
+		// that never set these variables see no behaviour change.
+		AntigravityFilterMode:           strings.ToLower(env("AIHUB_ANTIGRAVITY_FILTER_MODE", "off")),
+		AntigravityFilterUseDefault:     envBool("AIHUB_ANTIGRAVITY_FILTER_USE_DEFAULT_KEYWORDS", true),
+		AntigravityFilterCustomMappings: env("AIHUB_ANTIGRAVITY_FILTER_CUSTOM_MAPPINGS", ""),
 	}
 
 	if cfg.DatabaseURL == "" {
 		return nil, fmt.Errorf("AIHUB_DATABASE_URL (or DATABASE_URL) is required")
+	}
+
+	// Validate the antigravity filter mode early so a typo is loud at boot
+	// instead of silently disabling the filter.
+	switch cfg.AntigravityFilterMode {
+	case "", "off", "block", "rewrite":
+		// ok
+	default:
+		return nil, fmt.Errorf("AIHUB_ANTIGRAVITY_FILTER_MODE must be one of: off, block, rewrite; got %q",
+			cfg.AntigravityFilterMode)
 	}
 
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {

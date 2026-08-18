@@ -162,11 +162,54 @@ that matter most:
 | `AIHUB_ADMIN_USERNAME` | — | Optional. Skips the setup screen for the first account. |
 | `AIHUB_LOCAL_OAUTH_LISTENERS` | `false` | Capture provider redirects locally. |
 | `AIHUB_TRUST_PROXY_HEADERS` | `false` | Enable only behind your own reverse proxy. |
+| `AIHUB_ANTIGRAVITY_FILTER_MODE` | `off` | Screen requests bound for the Antigravity upstream for non-Antigravity coding-client names inside the JSON `system` field. `block` rejects with HTTP 403, `rewrite` replaces the names with "Antigravity". |
+| `AIHUB_ANTIGRAVITY_FILTER_USE_DEFAULT_KEYWORDS` | `true` | Toggle the built-in preset (Claude Code, Codex, Cursor, Windsurf, Cline, Aider, etc.). |
+| `AIHUB_ANTIGRAVITY_FILTER_CUSTOM_MAPPINGS` | — | Extra `from: to` pairs, comma- or newline-delimited. |
 
 > **Back up the encryption key.** It is generated on first start and written to
 > `$AIHUB_DATA_DIR/encryption.key`. Lose it and every stored provider credential becomes
 > unreadable — every connection has to be authorised again. In a container, set
 > `AIHUB_ENCRYPTION_KEY` explicitly or persist `/data`.
+
+## Antigravity coding filter
+
+aihub can screen requests bound for the Antigravity upstream for non-Antigravity
+coding-client names inside the JSON `system` field. The filter is a native Go
+port of the [cpa-plugin-antigravity-coding-filter](https://github.com/jellyfish-p/cpa-plugin-antigravity-coding-filter)
+plugin — it ships inside the binary, so no plugin runtime is needed.
+
+| Mode | Behaviour |
+| --- | --- |
+| `off` (default) | No filtering; every request passes through. |
+| `block` | Reject matching requests with HTTP 403 and an error of type `blocked_by_antigravity_coding_filter`. |
+| `rewrite` | Replace matched names with `Antigravity` and forward the rewritten request. |
+
+Matching is case-insensitive and only scans JSON fields named `system`. Mentions
+in `messages`, user prompts, or any other field do **not** trigger the filter.
+
+### Configuration
+
+```bash
+# .env
+AIHUB_ANTIGRAVITY_FILTER_MODE=block
+AIHUB_ANTIGRAVITY_FILTER_USE_DEFAULT_KEYWORDS=true
+AIHUB_ANTIGRAVITY_FILTER_CUSTOM_MAPPINGS=Cursor: Antigravity, Windsurf: Antigravity
+```
+
+The built-in preset covers the major AI coding editors, terminal agents and
+general-purpose coding agents: Claude Code, OpenAI Codex / Codex CLI, OpenCode,
+GitHub Copilot / Copilot CLI, Gemini Code Assist / Gemini CLI, Cursor, Windsurf
+/ Codeium, Cline, Roo Code, Kilo Code, Aider, Continue.dev, Amazon Q Developer /
+CodeWhisperer, JetBrains AI Assistant / Junie, Kiro, Qoder / Qoder CLI, Qwen Code,
+Trae, Tabnine, Sourcegraph Cody, Augment Code, Replit Agent / Ghostwriter, Devin,
+OpenHands, SWE-agent, Goose, Zed AI, Void Editor, PearAI, Refact.ai, Tabby,
+GitLab Duo, Visual Studio IntelliCode, CodeBuddy, Blackbox AI, Pieces for
+Developers, Qodo / CodiumAI, Rovo Dev CLI, Factory Droid, OpenClaw (incl. Clawdbot
+and Moltbot), Hermes Agent and WorkBuddy.
+
+Disable `AIHUB_ANTIGRAVITY_FILTER_USE_DEFAULT_KEYWORDS` and supply your own
+keyword list via `AIHUB_ANTIGRAVITY_FILTER_CUSTOM_MAPPINGS` to override the
+preset entirely.
 
 ## Deploying elsewhere
 
