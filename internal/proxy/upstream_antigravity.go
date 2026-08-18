@@ -44,6 +44,10 @@ type antigravityExecutor struct {
 	tokens *provider.TokenManager
 	vendor provider.Provider
 	log    *slog.Logger
+	// debug, when true, logs the request body, response status, headers
+	// and body (bounded to 16 KiB) for every upstream call. The router
+	// sets this from config.DebugRequests at construction time.
+	debug bool
 }
 
 func newAntigravityExecutor(client *http.Client, tokens *provider.TokenManager, vendor provider.Provider, logger *slog.Logger) *antigravityExecutor {
@@ -136,13 +140,38 @@ func (e *antigravityExecutor) send(ctx context.Context, conn *model.Connection, 
 		httpReq.Header.Set("Accept", "application/json")
 	}
 
+	if e.debug {
+		e.logDebug("antigravity upstream request",
+			"connection", conn.ID,
+			"url", url,
+			"stream", req.Stream,
+			"project_id", conn.ProjectID,
+			"model", req.Model,
+			"request_body", truncateForLog(string(body), 16*1024),
+		)
+	}
+
 	resp, err := e.client.Do(httpReq)
 	if err != nil {
 		return nil, asAPIError(model.ProviderAntigravity, err)
 	}
+	if e.debug {
+		e.logDebug("antigravity upstream response status",
+			"connection", conn.ID,
+			"status", resp.StatusCode,
+			"content_type", resp.Header.Get("Content-Type"),
+		)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		body := readErrorBody(resp.Body)
 		resp.Body.Close()
+		if e.debug {
+			e.logDebug("antigravity upstream error body",
+				"connection", conn.ID,
+				"status", resp.StatusCode,
+				"error_body", truncateForLog(string(body), 16*1024),
+			)
+		}
 
 		// Cloud Code 403 with "has not been used in project …"
 		// means the project id we just sent is stale: Google
@@ -468,4 +497,28 @@ func antigravityProjectRouteError(body []byte) bool {
 		strings.Contains(text, "accessnotconfiguredured") ||
 		strings.Contains(text, "permission_denied") ||
 		strings.Contains(text, "it is disabled")
+}
+
+// logDebug wraps e.log.Debug so the call sites stay readable. It is
+// only ever called under the e.debug guard, so the structured-logging
+// argument list is built unconditionally — slog already short-circuits
+// arguments at the API level when the level is filtered out, and the
+// debug path here means the level filter has already been turned off
+// by AIHUB_DEBUG_REQUESTS=true.
+func (e *antigravityExecutor) logDebug(msg string, args ...any) {
+	if e == nil || e.log == nil {
+		return
+	}
+	e.log.Debug(msg, args...)
+}
+
+// truncateForLog bounds the size of a string so a single chat
+// completion with a 100-KB body does not flood the log. The default
+// 16 KiB is enough to see the system prompt and the first turn, which
+// is what an operator chasing an upstream 400 needs.
+func truncateForLog(s string, limit int) string {
+	if limit <= 0 || len(s) <= limit {
+		return s
+	}
+	return s[:limit] + "…"
 }

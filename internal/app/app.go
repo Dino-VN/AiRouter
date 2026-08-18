@@ -83,6 +83,11 @@ func New(ctx context.Context, cfg *config.Config, logger *slog.Logger, version s
 	if filter := buildAntigravityFilter(cfg, logger); filter != nil {
 		a.router.SetAntigravityFilter(filter)
 	}
+	// Debug logging: when AIHUB_DEBUG_REQUESTS=true, the antigravity and
+	// codex executors log the request body, response status and body
+	// (bounded) for every upstream call. The default is off so the log
+	// stays quiet on a healthy deployment.
+	a.router.SetDebugRequests(cfg.DebugRequests)
 
 	if err = a.bootstrapAdmin(ctx); err != nil {
 		pool.Close()

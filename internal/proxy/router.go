@@ -81,6 +81,24 @@ func (r *Router) SetAntigravityFilter(filter *AntigravityFilter) {
 	}
 }
 
+// SetDebugRequests flips the per-executor debug flag on or off. When
+// on, the Antigravity and Codex executors log the request body, the
+// response status, headers and body (bounded) for every upstream
+// call. Off by default so the log stays quiet on a healthy deployment.
+func (r *Router) SetDebugRequests(on bool) {
+	if ex, ok := r.executors[model.ProviderAntigravity].(*antigravityExecutor); ok {
+		ex.debug = on
+	}
+	if ex, ok := r.executors[model.ProviderCodex].(*codexExecutor); ok {
+		ex.debug = on
+	}
+	if on {
+		r.log.Info("debug requests enabled for antigravity + codex executors")
+	} else {
+		r.log.Info("debug requests disabled")
+	}
+}
+
 // Call describes one proxied completion request.
 type Call struct {
 	// Format is the dialect the client is speaking.

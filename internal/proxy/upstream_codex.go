@@ -45,6 +45,10 @@ type codexExecutor struct {
 	client *http.Client
 	tokens *provider.TokenManager
 	log    *slog.Logger
+	// debug mirrors antigravityExecutor.debug — when true, the executor
+	// logs the request body, the response status, headers and body
+	// (bounded) for every upstream call. Set by Router.SetDebugRequests.
+	debug bool
 }
 
 func newCodexExecutor(client *http.Client, tokens *provider.TokenManager, logger *slog.Logger) *codexExecutor {
@@ -90,13 +94,41 @@ func (e *codexExecutor) send(ctx context.Context, conn *model.Connection, req *R
 		httpReq.Header.Set("Chatgpt-Account-Id", conn.AccountID)
 	}
 
+	if e.debug {
+		e.log.Debug("codex upstream request",
+			"connection", conn.ID,
+			"url", codexResponsesURL,
+			"raw", opts.Raw,
+			"stream", req.Stream,
+			"model", req.Model,
+			"input_messages", len(req.Messages),
+			"system_text_len", len(req.SystemText()),
+			"request_body", truncateForLog(string(body), 16*1024),
+		)
+	}
+
 	resp, err := e.client.Do(httpReq)
 	if err != nil {
 		return nil, asAPIError(model.ProviderCodex, err)
 	}
+	if e.debug {
+		e.log.Debug("codex upstream response status",
+			"connection", conn.ID,
+			"status", resp.StatusCode,
+			"content_type", resp.Header.Get("Content-Type"),
+		)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		defer resp.Body.Close()
-		return nil, apiErrorFromResponse(model.ProviderCodex, resp.StatusCode, resp.Header, readErrorBody(resp.Body))
+		errBody := readErrorBody(resp.Body)
+		resp.Body.Close()
+		if e.debug {
+			e.log.Debug("codex upstream error body",
+				"connection", conn.ID,
+				"status", resp.StatusCode,
+				"error_body", truncateForLog(string(errBody), 16*1024),
+			)
+		}
+		return nil, apiErrorFromResponse(model.ProviderCodex, resp.StatusCode, resp.Header, errBody)
 	}
 
 	stream := &upstreamStream{

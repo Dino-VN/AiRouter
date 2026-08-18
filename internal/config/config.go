@@ -66,6 +66,17 @@ type Config struct {
 	// X-Forwarded-For / X-Real-IP.
 	TrustProxyHeaders bool
 
+	// DebugRequests logs the full request body, response status,
+	// headers and body for every Antigravity and Codex upstream call
+	// at Debug level. The bodies are bounded to 16 KiB so a single
+	// proxied chat completion does not flood the log. Use this when
+	// chasing an upstream error whose cause is not obvious from the
+	// status code alone — the operator's "Resource has been
+	// exhausted" 403 and "messages must not be empty" 400 are both
+	// bugs where the actual cause is in the body the upstream sees,
+	// not in the status it returns.
+	DebugRequests bool
+
 	// AntigravityFilterMode controls the coding-client filter applied to
 	// requests bound for the Antigravity upstream. Valid values are "off"
 	// (default, filter disabled), "block" (reject matching requests with HTTP
@@ -107,6 +118,7 @@ func Load() (*Config, error) {
 		EnableLocalOAuthListeners: envBool("AIHUB_LOCAL_OAUTH_LISTENERS", false),
 		UsageRetentionDays:        envInt("AIHUB_USAGE_RETENTION_DAYS", 90),
 		TrustProxyHeaders:         envBool("AIHUB_TRUST_PROXY_HEADERS", false),
+		DebugRequests:             envBool("AIHUB_DEBUG_REQUESTS", false),
 
 		// Antigravity coding filter. Defaults to "rewrite" so a fresh
 		// deployment screens Antigravity-bound requests out of the box:
