@@ -63,10 +63,29 @@ type antigravityProvider struct {
 	versionMu      sync.Mutex
 	version        string
 	versionFetched time.Time
+
+	// projectMu guards projectRefreshInflight so concurrent requests
+	// for the same connection share a single loadCodeAssist round-trip
+	// rather than stampeding Google's backend.
+	projectMu              sync.Mutex
+	projectRefreshInflight map[string]*projectRefreshCall
+}
+
+// projectRefreshCall is the shared state for an in-flight loadCodeAssist
+// lookup. The first caller does the work; later callers wait on the
+// channel and adopt the result.
+type projectRefreshCall struct {
+	done chan struct{}
+	err  error
 }
 
 func newAntigravity(client *http.Client, logger *slog.Logger) *antigravityProvider {
-	return &antigravityProvider{http: client, log: logger, version: antigravityFallbackVersion}
+	return &antigravityProvider{
+		http:                   client,
+		log:                    logger,
+		version:                antigravityFallbackVersion,
+		projectRefreshInflight: map[string]*projectRefreshCall{},
+	}
 }
 
 func (p *antigravityProvider) ID() model.Provider   { return model.ProviderAntigravity }
@@ -172,6 +191,109 @@ func (p *antigravityProvider) Refresh(ctx context.Context, cred *model.Credentia
 		return nil, err
 	}
 	return &AuthResult{Credential: credentialFromToken(tok, cred)}, nil
+}
+
+// EnsureProjectID verifies the connection's stored project id is still
+// usable against the current access token and refreshes it in place
+// when it is not. The Cloud Code backend rejects requests whose
+// project id was deleted, disabled or never had the Cloud Code API
+// enabled with "Cloud Code Private API has not been used in project
+// …". OmniRoute (open-sse/services/antigravityProjectBootstrap.ts)
+// calls /v1internal:loadCodeAssist before every content request
+// specifically to dodge this; we mirror the same defensive lookup.
+//
+// When loadCodeAssist returns a project id that differs from the
+// stored one, the connection is updated in place so the caller's
+// next wrapAntigravityRequest picks up the new id. When loadCodeAssist
+// returns nothing, the function calls onboardUser to provision a new
+// project. Failures are non-fatal: the request is forwarded with
+// whatever id we have, and the upstream surfaces its own error if
+// the id is still no good.
+//
+// Concurrent requests for the same connection share a single
+// loadCodeAssist round-trip so the backend does not see a stampede
+// when the cached id expires and the proxy serves a burst of requests.
+func (p *antigravityProvider) EnsureProjectID(ctx context.Context, conn *model.Connection) error {
+	if conn == nil || conn.Credential == nil || conn.Credential.AccessToken == "" {
+		return fmt.Errorf("antigravity: connection has no access token")
+	}
+
+	// Per-token de-dup: if another goroutine is already refreshing
+	// this connection's project id, wait for it to finish and then
+	// re-check the cache. The cache key is the connection id (rather
+	// than the access token) so a refresh triggered by a stale
+	// token does not race with a refresh triggered by a fresh one.
+	key := conn.ID.String()
+	p.projectMu.Lock()
+	if call, ok := p.projectRefreshInflight[key]; ok {
+		p.projectMu.Unlock()
+		select {
+		case <-call.done:
+			return call.err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	call := &projectRefreshCall{done: make(chan struct{})}
+	p.projectRefreshInflight[key] = call
+	p.projectMu.Unlock()
+
+	defer func() {
+		close(call.done)
+		p.projectMu.Lock()
+		delete(p.projectRefreshInflight, key)
+		p.projectMu.Unlock()
+	}()
+
+	call.err = p.refreshProjectID(ctx, conn)
+	return call.err
+}
+
+// refreshProjectID does the actual work of EnsureProjectID without the
+// dedup layer. It is safe to call directly when the caller has already
+// serialised on the connection (e.g. the OAuth refresh path).
+func (p *antigravityProvider) refreshProjectID(ctx context.Context, conn *model.Connection) error {
+	info, err := p.loadCodeAssist(ctx, conn.Credential.AccessToken)
+	if err != nil {
+		// loadCodeAssist is best-effort here. If it fails (e.g.
+		// a transient backend error), forward the request with
+		// whatever id we have and let the upstream surface the
+		// real error if the id is no good.
+		p.log.Debug("antigravity: loadCodeAssist failed during project refresh; forwarding with stored project",
+			"connection", conn.ID, "error", err)
+		return nil
+	}
+
+	if info.projectID == conn.ProjectID {
+		// Cache hit: nothing to do.
+		return nil
+	}
+
+	if info.projectID == "" {
+		// The token has no project assigned yet. Onboard it so
+		// the next loadCodeAssist call returns one. If Google
+		// tells us to bring our own project, leave the stored
+		// id alone (the operator has to enter one in the GCP
+		// console) and forward the request.
+		newProjectID, onboardErr := p.onboardUser(ctx, conn.Credential.AccessToken, info.tierID)
+		if onboardErr != nil {
+			p.log.Warn("antigravity: onboardUser during project refresh failed",
+				"connection", conn.ID, "error", onboardErr)
+			return nil
+		}
+		if newProjectID == "" {
+			return nil
+		}
+		info.projectID = newProjectID
+	}
+
+	if conn.ProjectID != info.projectID {
+		old := conn.ProjectID
+		conn.ProjectID = info.projectID
+		p.log.Info("antigravity: refreshed project id",
+			"connection", conn.ID, "old", old, "new", info.projectID)
+	}
+	return nil
 }
 
 func (p *antigravityProvider) FetchQuota(ctx context.Context, conn *model.Connection) (*model.UpstreamQuota, error) {

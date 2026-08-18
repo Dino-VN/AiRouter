@@ -57,10 +57,39 @@ func (e *antigravityExecutor) passthrough(format Format) bool {
 	return format == FormatGemini
 }
 
+// antigravityProjectEnsurer is implemented by providers that can
+// re-resolve a connection's project id at request time. The Antigravity
+// provider implements it to dodge the "Cloud Code Private API has not
+// been used in project …" 403 the upstream returns when the stored
+// project id has gone stale (project deleted, API disabled, account
+// re-onboarded by the IDE between requests). The interface lives here
+// so the executor does not have to import the provider package.
+type antigravityProjectEnsurer interface {
+	EnsureProjectID(ctx context.Context, conn *model.Connection) error
+}
+
 func (e *antigravityExecutor) send(ctx context.Context, conn *model.Connection, req *Request, opts sendOptions) (*upstreamStream, error) {
 	cred, err := e.tokens.Ensure(ctx, conn)
 	if err != nil {
 		return nil, asAPIError(model.ProviderAntigravity, err)
+	}
+
+	// Re-resolve the connection's project id before building the
+	// envelope. This is the same defensive lookup OmniRoute does in
+	// open-sse/services/antigravityProjectBootstrap.ts before every
+	// content request: loadCodeAssist tells us which project Google
+	// currently associates with the access token, and if it does not
+	// match what we stored at onboarding time the upstream will 403
+	// with "Cloud Code Private API has not been used in project …"
+	// on the very next call. OnboardUser is called as a fallback when
+	// loadCodeAssist reports no project at all.
+	if ensurer, ok := e.vendor.(antigravityProjectEnsurer); ok {
+		if ensureErr := ensurer.EnsureProjectID(ctx, conn); ensureErr != nil {
+			// Non-fatal: log and forward so the upstream can return its
+			// own error if the stored id really is no good.
+			e.log.Debug("antigravity: project id refresh failed; forwarding with stored id",
+				"connection", conn.ID, "error", ensureErr)
+		}
 	}
 
 	inner := req.Raw
