@@ -1,0 +1,41 @@
+# Secrets and local configuration. AIHUB_DATABASE_URL lives here.
+.env
+.env.*
+!.env.example
+
+# Build output. Both are anchored to the repository root on purpose: an
+# unanchored `dist/` would also exclude internal/webui/dist, and git never
+# descends into an excluded directory, so the negation below could not rescue
+# the committed placeholder.
+/bin/
+/dist/
+*.exe
+
+# Runtime data directory (generated encryption key, JWT secret)
+.aihub/
+data/
+
+# The web UI is built into internal/webui/dist. Only the committed placeholder
+# belongs in version control; the real build artefacts do not.
+internal/webui/dist/*
+!internal/webui/dist/index.html
+
+# Web UI
+web/node_modules/
+web/dist/
+web/.vite/
+web/*.tsbuildinfo
+web/.env
+web/.env.local
+
+# Go
+*.test
+*.out
+coverage.*
+vendor/
+
+# Editors and OS noise
+.idea/
+.vscode/
+*.swp
+.DS_Store

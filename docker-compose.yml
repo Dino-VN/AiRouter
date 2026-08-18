@@ -1,0 +1,64 @@
+# Two ways to run this:
+#
+#   docker compose up -d aihub          # bring your own PostgreSQL (e.g. Neon)
+#   docker compose --profile local up -d  # also run PostgreSQL in a container
+#
+# Put AIHUB_DATABASE_URL (and any other settings) in a .env file next to this
+# one; compose reads it automatically. Never commit that file.
+
+services:
+  aihub:
+    build:
+      context: .
+      args:
+        VERSION: ${AIHUB_VERSION:-compose}
+    image: aihub:latest
+    restart: unless-stopped
+    ports:
+      - "${AIHUB_PORT:-8317}:8317"
+    environment:
+      # Required. With the "local" profile below, point it at the db service:
+      #   postgres://aihub:aihub@db:5432/aihub?sslmode=disable
+      AIHUB_DATABASE_URL: ${AIHUB_DATABASE_URL:?set AIHUB_DATABASE_URL in .env}
+      # Recommended: pin these so credentials stay readable across redeploys.
+      AIHUB_ENCRYPTION_KEY: ${AIHUB_ENCRYPTION_KEY:-}
+      AIHUB_JWT_SECRET: ${AIHUB_JWT_SECRET:-}
+      # Optional. Leave unset and the UI offers a setup screen on first open;
+      # set both for an unattended deployment.
+      AIHUB_ADMIN_USERNAME: ${AIHUB_ADMIN_USERNAME:-}
+      AIHUB_ADMIN_PASSWORD: ${AIHUB_ADMIN_PASSWORD:-}
+      AIHUB_PUBLIC_URL: ${AIHUB_PUBLIC_URL:-}
+      # Behind a reverse proxy, this makes the login throttle see real client IPs.
+      AIHUB_TRUST_PROXY_HEADERS: ${AIHUB_TRUST_PROXY_HEADERS:-false}
+      AIHUB_USAGE_RETENTION_DAYS: ${AIHUB_USAGE_RETENTION_DAYS:-90}
+    volumes:
+      # Holds auto-generated secrets; drop it and stored provider credentials
+      # can no longer be decrypted.
+      - aihub-data:/data
+    healthcheck:
+      # The image has no shell, so the binary's own flag is the probe.
+      test: ["CMD", "/aihub", "-version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  db:
+    image: postgres:18-alpine
+    profiles: ["local"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: aihub
+      POSTGRES_PASSWORD: aihub
+      POSTGRES_DB: aihub
+    volumes:
+      - aihub-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aihub -d aihub"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  aihub-data:
+  aihub-db:

@@ -1,0 +1,43 @@
+# Keeps the build context small and secrets out of intermediate image layers.
+#
+# The runtime stage only copies the finished binary, so nothing here would have
+# reached the published image. Excluding .env still matters: without it the live
+# database URL is baked into the *build* stage, which is cached and can be
+# inspected with `docker history` on the builder host.
+.env
+.env.*
+!.env.example
+
+# Version control. web/.git in particular is a leftover from the UI scaffold.
+.git
+.gitignore
+.dockerignore
+**/.git
+
+# Installed dependencies and build output: every stage rebuilds these itself.
+# web/node_modules is by far the largest thing in the tree.
+web/node_modules
+web/dist
+web/.vite
+**/*.tsbuildinfo
+/bin
+/dist
+*.exe
+
+# Runtime state: the generated encryption key and JWT secret belong to whichever
+# machine produced them, never to an image.
+.aihub
+data
+
+# Documentation and deployment recipes are not build inputs; excluding them
+# means editing the README does not invalidate the `COPY . .` layer.
+README.md
+docker-compose.yml
+deploy
+web/README.md
+
+# Editor and OS noise.
+.idea
+.vscode
+*.swp
+.DS_Store
