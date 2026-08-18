@@ -208,9 +208,17 @@ func (e *antigravityExecutor) send(ctx context.Context, conn *model.Connection, 
 					retryReq.Header.Set("User-Agent", agent.UserAgent(ctx))
 				}
 				retryReq.Header.Set("X-Goog-Api-Client", "gl-node/22.21.1")
-				if conn.ProjectID != "" {
-					retryReq.Header.Set("X-Goog-User-Project", conn.ProjectID)
-				}
+				// OmniRoute's sendAntigravityRequest removes
+				// x-goog-user-project on a 403 retry (see
+				// open-sse/executors/antigravity/executeAttempt.ts:366).
+				// Some projects reject the header when the
+				// Cloud Code API is enabled-but-stale, and
+				// dropping it lets Google re-resolve the
+				// project from the access token. The
+				// envelope body still carries the project
+				// id so the upstream knows which project
+				// to bill against when the request lands.
+				// Do NOT set X-Goog-User-Project here.
 				if req.Stream {
 					retryReq.Header.Set("Accept", "text/event-stream")
 				} else {
@@ -222,11 +230,30 @@ func (e *antigravityExecutor) send(ctx context.Context, conn *model.Connection, 
 					return nil, asAPIError(model.ProviderAntigravity, retryErr)
 				}
 				if retryResp.StatusCode < 200 || retryResp.StatusCode > 299 {
+					// The retry also failed. When it failed with the
+					// same project-route shape, surface the upstream's
+					// enable-API console link verbatim so the operator
+					// knows to open the GCP console and click Enable —
+					// the proxy already did what it could.
 					defer retryResp.Body.Close()
+					retryBody := readErrorBody(retryResp.Body)
+					if antigravityProjectRouteError(retryBody) {
+						return nil, &APIError{
+							Status: http.StatusForbidden,
+							Type:   "project_route_error",
+							Code:   "cloud_code_api_disabled",
+							Message: "antigravity: the project Google assigned to this connection (" + conn.ProjectID + ") does not have the Cloud Code API enabled. " +
+								"The proxy already retried once after re-running loadCodeAssist + onboardUser, but Google returned the same project. " +
+								"Open the link the upstream returned and click \"Enable\", then send another request — the proxy will pick up the change without a restart.\n\n" +
+								truncate(string(retryBody), 1500),
+							Upstream:  retryResp.StatusCode,
+							Retryable: false,
+						}
+					}
 					return nil, apiErrorFromResponse(model.ProviderAntigravity,
-						retryResp.StatusCode, retryResp.Header, readErrorBody(retryResp.Body))
+						retryResp.StatusCode, retryResp.Header, retryBody)
 				}
-				// Replace the original response with the retry's so the
+				// Retry succeeded: replace the original response so the
 				// rest of send() consumes it as if the 403 never happened.
 				resp = retryResp
 				opts.RetryedProjectRoute = true

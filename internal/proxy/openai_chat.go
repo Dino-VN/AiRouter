@@ -119,6 +119,26 @@ func parseOpenAIChat(raw []byte) (*Request, error) {
 			return nil, err
 		}
 
+		// An OpenAI Chat message is supposed to carry its text inside the
+		// `content` field (either a string or an array of typed parts).
+		// When `content` is missing — usually because the caller typed
+		// `conterra` or `cotnent` instead of `content` — parseChatContent
+		// returns no parts and the message gets dropped. The caller then
+		// sees "messages must not be empty" without any clue which
+		// message was wrong. Short-circuit that case here with a clear
+		// pointer at the offending role so the operator can fix the
+		// typo without having to turn on AIHUB_DEBUG_REQUESTS.
+		if len(parts) == 0 && msg.Role != "tool" && msg.Role != "function" {
+			role := strings.TrimSpace(strings.ToLower(msg.Role))
+			if role == "" {
+				role = "(missing role)"
+			}
+			return nil, newAPIError(http.StatusBadRequest, "invalid_request_error",
+				"message with role "+role+" has no content; the field is "+
+					"named 'content' (string or array of parts) — check for typos "+
+					"like 'conterra' or 'cotnent'")
+		}
+
 		switch strings.ToLower(msg.Role) {
 		case "system", "developer":
 			req.System = append(req.System, parts...)
