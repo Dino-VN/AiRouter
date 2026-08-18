@@ -56,14 +56,13 @@ export default function ProvidersPage() {
   const providers = view.data?.providers.providers ?? []
   const endpoints = view.data?.openai.endpoints ?? []
 
-  // OAuth providers: Codex is always visible (it's the default upstream);
-  // Antigravity auto-hides when the caller has no Antigravity connection
-  // yet, so the launcher does not advertise a sign-in flow the operator
-  // has no use for. There is no toggle — the card comes back on its own
-  // the moment an Antigravity account is attached from another route.
-  const oauthProviders = providers.filter(
-    (p) => p.oauth && (p.id !== "antigravity" || p.connections > 0)
-  )
+  // OAuth providers always render, even when the operator has no
+  // account yet: the launcher is also the entry point for adding an
+  // Antigravity / Codex account, so hiding a card with zero connections
+  // would also hide the "Add account" button that creates the first one.
+  // The empty-state messaging on each card itself says "0 of 0 usable",
+  // which is enough information for the operator.
+  const oauthProviders = providers.filter((p) => p.oauth)
   const openAIProvider = providers.find((p) => p.id === "openai")
 
   return (
