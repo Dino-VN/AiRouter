@@ -162,7 +162,7 @@ that matter most:
 | `AIHUB_ADMIN_USERNAME` | — | Optional. Skips the setup screen for the first account. |
 | `AIHUB_LOCAL_OAUTH_LISTENERS` | `false` | Capture provider redirects locally. |
 | `AIHUB_TRUST_PROXY_HEADERS` | `false` | Enable only behind your own reverse proxy. |
-| `AIHUB_ANTIGRAVITY_FILTER_MODE` | `off` | Screen requests bound for the Antigravity upstream for non-Antigravity coding-client names inside the JSON `system` field. `block` rejects with HTTP 403, `rewrite` replaces the names with "Antigravity". |
+| `AIHUB_ANTIGRAVITY_FILTER_MODE` | `rewrite` | Screen requests bound for the Antigravity upstream for non-Antigravity coding-client names inside the JSON `system` field. `block` rejects with HTTP 403, `rewrite` replaces the names with "Antigravity", `off` disables. |
 | `AIHUB_ANTIGRAVITY_FILTER_USE_DEFAULT_KEYWORDS` | `true` | Toggle the built-in preset (Claude Code, Codex, Cursor, Windsurf, Cline, Aider, etc.). |
 | `AIHUB_ANTIGRAVITY_FILTER_CUSTOM_MAPPINGS` | — | Extra `from: to` pairs, comma- or newline-delimited. |
 
@@ -180,9 +180,9 @@ plugin — it ships inside the binary, so no plugin runtime is needed.
 
 | Mode | Behaviour |
 | --- | --- |
-| `off` (default) | No filtering; every request passes through. |
+| `off` | No filtering; every request passes through. |
 | `block` | Reject matching requests with HTTP 403 and an error of type `blocked_by_antigravity_coding_filter`. |
-| `rewrite` | Replace matched names with `Antigravity` and forward the rewritten request. |
+| `rewrite` (default) | Replace matched names with `Antigravity` and forward the rewritten request. |
 
 Matching is case-insensitive and only scans JSON fields named `system`. Mentions
 in `messages`, user prompts, or any other field do **not** trigger the filter.

@@ -201,10 +201,170 @@ func (p *antigravityProvider) FetchQuota(ctx context.Context, conn *model.Connec
 	quota := &model.UpstreamQuota{Plan: info.plan, UpdatedAt: time.Now()}
 	if info.credits != nil {
 		quota.Credits = info.credits
-	} else {
-		quota.Note = "This account has no Google One AI credit pool; usage falls back to the free tier."
+	}
+
+	// Pull the per-window rate-limit summary. The endpoint is
+	// /v1internal:retrieveUserQuotaSummary and it returns one group per
+	// tier (e.g. "Gemini" and "Claude, ChatGPT" for paid plans) with a
+	// list of buckets describing how much of each window is left.
+	// Failure here degrades gracefully — the credit snapshot from
+	// loadCodeAssist is still returned so the operator sees something.
+	if summary, sErr := p.retrieveUserQuotaSummary(ctx, conn.Credential.AccessToken, info.projectID); sErr == nil && summary != nil {
+		for _, g := range summary.groups {
+			for _, b := range g.buckets {
+				used := 100.0 - (b.remainingFraction * 100.0)
+				if used < 0 {
+					used = 0
+				}
+				if used > 100 {
+					used = 100
+				}
+				window := model.QuotaWindow{
+					Name:        g.displayName + " · " + b.label,
+					UsedPercent: used,
+				}
+				if b.window != "" {
+					window.Name = g.displayName + " · " + b.window
+				}
+				if b.resetTime != "" {
+					if t, parseErr := time.Parse(time.RFC3339, b.resetTime); parseErr == nil {
+						window.ResetsAt = &t
+						if t.After(time.Now()) {
+							window.ResetsInSeconds = int64(t.Sub(time.Now()).Seconds())
+						}
+					}
+				}
+				if b.window != "" {
+					switch strings.ToLower(b.window) {
+					case "5h", "five-hour", "five_hour":
+						window.WindowMinutes = 5 * 60
+					case "weekly", "week":
+						window.WindowMinutes = 7 * 24 * 60
+					}
+				}
+				quota.Windows = append(quota.Windows, window)
+			}
+		}
+		if len(quota.Windows) == 0 {
+			quota.Note = "Account is on a " + info.plan + " tier; the upstream did not report any rate-limit windows yet."
+		}
+	}
+	if info.credits == nil && len(quota.Windows) == 0 {
+		quota.Note = "This account has no Google One AI credit pool and no per-window rate-limit summary; usage falls back to the free tier."
 	}
 	return quota, nil
+}
+
+// userQuotaSummary is the parsed shape of /v1internal:retrieveUserQuotaSummary.
+// The endpoint returns one group per tier (Gemini tier, Claude+ChatGPT tier,
+// etc.) and each group carries a list of buckets describing how much of each
+// rate-limit window is left. This shape mirrors CLIProxyAPI's
+// AntigravityQuotaSummaryPayload so the numbers match what the official
+// Antigravity CLI displays.
+type userQuotaSummary struct {
+	groups []userQuotaGroup
+}
+
+type userQuotaGroup struct {
+	displayName string
+	description string
+	buckets     []userQuotaBucket
+}
+
+type userQuotaBucket struct {
+	bucketID          string
+	label             string
+	window            string
+	resetTime         string
+	remainingFraction float64
+	description       string
+}
+
+// retrieveUserQuotaSummary calls POST /v1internal:retrieveUserQuotaSummary
+// with the project ID and returns the per-tier rate-limit windows. The call
+// is bounded by the caller's request context; a failure returns nil rather
+// than an error so the caller can fall back to whatever loadCodeAssist
+// already provided.
+func (p *antigravityProvider) retrieveUserQuotaSummary(ctx context.Context, accessToken, projectID string) (*userQuotaSummary, error) {
+	if accessToken == "" {
+		return nil, fmt.Errorf("antigravity: no access token")
+	}
+	if projectID == "" {
+		return nil, fmt.Errorf("antigravity: no project id; cannot fetch quota summary")
+	}
+
+	payload, err := json.Marshal(map[string]any{"project": projectID})
+	if err != nil {
+		return nil, fmt.Errorf("marshal quota summary request: %w", err)
+	}
+	endpoint := fmt.Sprintf("%s/%s:retrieveUserQuotaSummary", AntigravityAPIEndpoint, antigravityAPIVersion)
+	body, err := p.callAPI(ctx, endpoint, accessToken, payload, false)
+	if err != nil {
+		return nil, err
+	}
+
+	var raw struct {
+		Groups []struct {
+			DisplayName string `json:"displayName"`
+			Display     string `json:"display_name"`
+			Description string `json:"description"`
+			Buckets     []struct {
+				BucketID           string  `json:"bucketId"`
+				BucketIDAlt        string  `json:"bucket_id"`
+				DisplayName        string  `json:"displayName"`
+				Display            string  `json:"display_name"`
+				Window             string  `json:"window"`
+				ResetTime          string  `json:"resetTime"`
+				ResetTimeAlt       string  `json:"reset_time"`
+				RemainingFraction  float64 `json:"remainingFraction"`
+				RemainingFraction2 float64 `json:"remaining_fraction"`
+				Description        string  `json:"description"`
+			} `json:"buckets"`
+		} `json:"groups"`
+	}
+	if err = json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("decode quota summary: %w", err)
+	}
+
+	out := &userQuotaSummary{}
+	for _, g := range raw.Groups {
+		group := userQuotaGroup{
+			displayName: firstNonEmptyString(g.DisplayName, g.Display),
+			description: g.Description,
+		}
+		if group.displayName == "" {
+			group.displayName = "Quota"
+		}
+		for _, b := range g.Buckets {
+			remaining := b.RemainingFraction
+			if remaining == 0 {
+				remaining = b.RemainingFraction2
+			}
+			bucket := userQuotaBucket{
+				bucketID:          firstNonEmptyString(b.BucketID, b.BucketIDAlt),
+				label:             firstNonEmptyString(b.DisplayName, b.Display, b.BucketID, b.BucketIDAlt),
+				window:            b.Window,
+				resetTime:         firstNonEmptyString(b.ResetTime, b.ResetTimeAlt),
+				remainingFraction: remaining,
+				description:       b.Description,
+			}
+			group.buckets = append(group.buckets, bucket)
+		}
+		out.groups = append(out.groups, group)
+	}
+	return out, nil
+}
+
+// firstNonEmptyString returns the first non-empty argument, or "" when all
+// are empty. Mirrors firstNonEmpty from the proxy package but scoped to
+// this file to avoid an import cycle.
+func firstNonEmptyString(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // token performs a Google OAuth token call.

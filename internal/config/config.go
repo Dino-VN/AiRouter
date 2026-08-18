@@ -108,9 +108,15 @@ func Load() (*Config, error) {
 		UsageRetentionDays:        envInt("AIHUB_USAGE_RETENTION_DAYS", 90),
 		TrustProxyHeaders:         envBool("AIHUB_TRUST_PROXY_HEADERS", false),
 
-		// Antigravity coding filter. Defaults to "off" so existing deployments
-		// that never set these variables see no behaviour change.
-		AntigravityFilterMode:           strings.ToLower(env("AIHUB_ANTIGRAVITY_FILTER_MODE", "off")),
+		// Antigravity coding filter. Defaults to "rewrite" so a fresh
+		// deployment screens Antigravity-bound requests out of the box:
+		// system-prompt fields mentioning Claude Code / Codex / OpenCode
+		// / Cursor / Windsurf / Cline / Aider / Continue.dev / etc. are
+		// silently rewritten to "Antigravity" instead of being blocked,
+		// which keeps upstream compatibility while hiding the
+		// originating client name. Set to "off" to disable, "block" to
+		// reject instead.
+		AntigravityFilterMode:           strings.ToLower(env("AIHUB_ANTIGRAVITY_FILTER_MODE", "rewrite")),
 		AntigravityFilterUseDefault:     envBool("AIHUB_ANTIGRAVITY_FILTER_USE_DEFAULT_KEYWORDS", true),
 		AntigravityFilterCustomMappings: env("AIHUB_ANTIGRAVITY_FILTER_CUSTOM_MAPPINGS", ""),
 	}

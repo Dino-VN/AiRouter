@@ -139,12 +139,23 @@ func (p *codexProvider) Refresh(ctx context.Context, cred *model.Credential) (*A
 	return p.result(tok)
 }
 
-func (p *codexProvider) FetchQuota(_ context.Context, conn *model.Connection) (*model.UpstreamQuota, error) {
-	// ChatGPT reports Codex usage only in the response headers of a real
-	// completion call, so there is no quota endpoint to poll. Keep whatever
-	// the last proxied request observed (so the UI continues to show rate
-	// limit windows when they exist), and refresh the plan from the ID token
-	// — that part is always up to date.
+// codexUsageURL is the ChatGPT backend endpoint the Codex CLI itself hits
+// to read its rate-limit windows. The response shape is documented at
+// CodexUsagePayload below; the per-window fields are mirrored from
+// CLIProxyAPI's parser so the operator sees the same numbers the
+// upstream CLI would.
+const codexUsageURL = "https://chatgpt.com/backend-api/wham/usage"
+
+// codexUserAgent identifies this client to the wham/usage endpoint. The
+// Codex CLI itself sends "codex_cli_rs/<version> (...)" and the backend
+// refuses unknown originators.
+const codexUsageUserAgent = "codex_cli_rs/0.51.0 (Linux 6.1.0; x86_64) aihub"
+
+func (p *codexProvider) FetchQuota(ctx context.Context, conn *model.Connection) (*model.UpstreamQuota, error) {
+	// Always start from whatever windows were already captured on proxied
+	// responses (the x-codex-primary-* / x-codex-secondary-* headers), so a
+	// failure to reach wham/usage does not blank out a connection that
+	// has just served a request and therefore has fresh numbers.
 	quota := &model.UpstreamQuota{UpdatedAt: time.Now()}
 	if conn.Quota != nil {
 		quota.Windows = conn.Quota.Windows
@@ -155,24 +166,217 @@ func (p *codexProvider) FetchQuota(_ context.Context, conn *model.Connection) (*
 			quota.Plan = info.Plan
 		}
 	}
+
+	// Actively poll the wham/usage endpoint so an operator's "refresh
+	// quota" click produces fresh numbers even when the connection has
+	// not just served a request. The call is bounded by the caller's
+	// request context; failure falls through to whatever headers were
+	// captured previously.
+	if conn.Credential != nil && conn.Credential.AccessToken != "" {
+		if usage, err := p.fetchCodexUsage(ctx, conn); err == nil && usage != nil {
+			if usage.Plan != "" {
+				quota.Plan = usage.Plan
+			}
+			// Replace the snapshot rather than merging: the upstream's
+			// view is authoritative, and stale headers from before a
+			// plan upgrade should not survive a successful wham/usage
+			// fetch.
+			if len(usage.Windows) > 0 {
+				quota.Windows = usage.Windows
+			}
+			quota.Note = usage.Note
+		}
+	}
+
 	if len(quota.Windows) == 0 {
-		// Make the "no data" state self-explanatory in the UI rather than
-		// looking like a bug. Operators reading this know exactly what to do:
-		// route a single chat completion through this connection, and the
-		// response headers populate the windows on the next refresh.
-		quota.Note = "ChatGPT does not expose a Codex quota endpoint. The " +
-			"x-codex-primary-* and x-codex-secondary-* rate-limit headers " +
-			"are captured on every proxied completion and shown here once " +
-			"this connection has served at least one request."
-	} else {
-		// Explain where the windows came from so the operator can tell a
-		// stale snapshot (e.g. headers from before a plan upgrade) apart
-		// from a fresh one.
-		quota.Note = "Captured from response headers of the last proxied " +
-			"completion. ChatGPT does not expose a Codex quota endpoint, " +
-			"so these windows are only as fresh as the most recent request."
+		quota.Note = "ChatGPT's wham/usage endpoint is not reachable from " +
+			"this server, and no x-codex-primary-* / x-codex-secondary-* " +
+			"headers have been captured on a proxied completion yet. Send " +
+			"one request through this connection and refresh; the response " +
+			"headers populate the windows here."
 	}
 	return quota, nil
+}
+
+// codexUsageQuota is the parsed shape of wham/usage that this provider
+// needs to surface back to the caller. The wire shape carries more
+// (rate_limit_reset_credits, code_review_rate_limit, additional_rate_limits)
+// than the operator-facing UI shows today; only the windows the UI
+// already understands are extracted here.
+type codexUsageQuota struct {
+	Plan    string
+	Windows []model.QuotaWindow
+	Note    string
+}
+
+// fetchCodexUsage calls GET https://chatgpt.com/backend-api/wham/usage
+// with the account's access token and parses its rate-limit windows.
+//
+// The endpoint reports:
+//   - rate_limit.primary_window: 5-hour rolling window (used_percent, limit_window_seconds, reset_after_seconds, reset_at)
+//   - rate_limit.secondary_window: weekly window for paid plans, monthly for the free tier
+//   - code_review_rate_limit: the same shape, but for the code review tool
+//   - additional_rate_limits: per-feature rate limits (e.g. image generation)
+//   - rate_limit_reset_credits: top-up credits the operator can spend
+//
+// We mirror the classification logic from CLIProxyAPI's parser so the
+// numbers shown here match what the Codex CLI itself displays.
+func (p *codexProvider) fetchCodexUsage(ctx context.Context, conn *model.Connection) (*codexUsageQuota, error) {
+	if conn.Credential == nil || conn.Credential.AccessToken == "" {
+		return nil, fmt.Errorf("codex: connection has no access token")
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, codexUsageURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("codex usage request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+conn.Credential.AccessToken)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", codexUsageUserAgent)
+	if conn.AccountID != "" {
+		req.Header.Set("Chatgpt-Account-Id", conn.AccountID)
+	}
+
+	resp, err := p.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("codex usage request: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return nil, fmt.Errorf("codex usage response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("codex usage endpoint returned %d: %s",
+			resp.StatusCode, truncateForError(string(body)))
+	}
+
+	return parseCodexUsageBody(body)
+}
+
+// parseCodexUsageBody extracts the rate-limit windows from a wham/usage
+// response. The shape mirrors CLIProxyAPI's CodexUsagePayload.
+func parseCodexUsageBody(body []byte) (*codexUsageQuota, error) {
+	var raw struct {
+		PlanType             string                      `json:"plan_type"`
+		RateLimit            *codexUsageRateLimit        `json:"rate_limit,omitempty"`
+		CodeReviewRateLimit  *codexUsageRateLimit        `json:"code_review_rate_limit,omitempty"`
+		AdditionalRateLimits []codexUsageAdditionalLimit `json:"additional_rate_limits,omitempty"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("decode codex usage: %w", err)
+	}
+
+	out := &codexUsageQuota{Plan: raw.PlanType}
+	now := time.Now()
+	const fiveHourSeconds int64 = 18000
+	const weekSeconds int64 = 604800
+	const minMonth int64 = 28 * 24 * 60 * 60
+	const maxMonth int64 = 31 * 24 * 60 * 60
+
+	add := func(name string, w *codexUsageWindow, limitReached, allowed *bool) {
+		if w == nil {
+			return
+		}
+		win := model.QuotaWindow{Name: name}
+		if w.UsedPercent != nil {
+			win.UsedPercent = *w.UsedPercent
+		} else if (limitReached != nil && *limitReached) || (allowed != nil && !*allowed) {
+			win.UsedPercent = 100
+		}
+		if w.LimitWindowSeconds != nil {
+			win.WindowMinutes = int(*w.LimitWindowSeconds / 60)
+		}
+		if w.ResetAfterSeconds != nil && *w.ResetAfterSeconds > 0 {
+			win.ResetsInSeconds = *w.ResetAfterSeconds
+			resetsAt := now.Add(time.Duration(*w.ResetAfterSeconds) * time.Second)
+			win.ResetsAt = &resetsAt
+		}
+		if w.ResetAt != nil && !w.ResetAt.IsZero() {
+			win.ResetsAt = w.ResetAt
+			if win.ResetsInSeconds == 0 && w.ResetAt.After(now) {
+				win.ResetsInSeconds = int64(w.ResetAt.Sub(now).Seconds())
+			}
+		}
+		out.Windows = append(out.Windows, win)
+	}
+
+	// Primary window is the 5-hour rolling window; secondary is weekly
+	// (paid) or monthly (free). Classification uses limit_window_seconds
+	// when present, falling back to positional primary/secondary ordering
+	// for older payloads.
+	pickClassified := func(limit *codexUsageRateLimit, name5h, nameWeek, nameMonth string) {
+		if limit == nil {
+			return
+		}
+		var fiveHour, weekly *codexUsageWindow
+		for _, w := range []*codexUsageWindow{limit.PrimaryWindow, limit.SecondaryWindow} {
+			if w == nil || w.LimitWindowSeconds == nil {
+				continue
+			}
+			secs := *w.LimitWindowSeconds
+			if secs == fiveHourSeconds && fiveHour == nil {
+				fiveHour = w
+			} else if (secs == weekSeconds || (secs >= minMonth && secs <= maxMonth)) && weekly == nil {
+				weekly = w
+			}
+		}
+		if fiveHour == nil {
+			fiveHour = limit.PrimaryWindow
+		}
+		if weekly == nil {
+			weekly = limit.SecondaryWindow
+		}
+		add(name5h, fiveHour, limit.LimitReached, limit.Allowed)
+		weeklyName := nameWeek
+		if weekly != nil && weekly.LimitWindowSeconds != nil {
+			secs := *weekly.LimitWindowSeconds
+			if secs >= minMonth && secs <= maxMonth {
+				weeklyName = nameMonth
+			}
+		}
+		add(weeklyName, weekly, limit.LimitReached, limit.Allowed)
+	}
+
+	pickClassified(raw.RateLimit, "primary", "secondary", "monthly")
+	pickClassified(raw.CodeReviewRateLimit, "code-review-primary", "code-review-secondary", "code-review-monthly")
+	for _, extra := range raw.AdditionalRateLimits {
+		name := strings.TrimSpace(extra.LimitName)
+		if name == "" {
+			name = strings.TrimSpace(extra.MeteredFeature)
+		}
+		if name == "" {
+			name = "additional"
+		}
+		pickClassified(extra.RateLimit, name+"-primary", name+"-secondary", name+"-monthly")
+	}
+
+	return out, nil
+}
+
+// codexUsageRateLimit is one rate-limit group inside the wham/usage
+// response. Fields are pointer-typed so a missing key is distinguishable
+// from a zero value (a 0% used window is a perfectly valid report).
+type codexUsageRateLimit struct {
+	Allowed         *bool             `json:"allowed,omitempty"`
+	LimitReached    *bool             `json:"limit_reached,omitempty"`
+	PrimaryWindow   *codexUsageWindow `json:"primary_window,omitempty"`
+	SecondaryWindow *codexUsageWindow `json:"secondary_window,omitempty"`
+}
+
+// codexUsageWindow is one window inside a rate-limit group.
+type codexUsageWindow struct {
+	UsedPercent        *float64   `json:"used_percent,omitempty"`
+	LimitWindowSeconds *int64     `json:"limit_window_seconds,omitempty"`
+	ResetAfterSeconds  *int64     `json:"reset_after_seconds,omitempty"`
+	ResetAt            *time.Time `json:"reset_at,omitempty"`
+}
+
+// codexUsageAdditionalLimit is one entry in additional_rate_limits.
+type codexUsageAdditionalLimit struct {
+	LimitName      string               `json:"limit_name,omitempty"`
+	MeteredFeature string               `json:"metered_feature,omitempty"`
+	RateLimit      *codexUsageRateLimit `json:"rate_limit,omitempty"`
 }
 
 // tokenResponse is the shape of both the code exchange and the refresh response.
