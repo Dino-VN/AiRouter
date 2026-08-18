@@ -422,7 +422,32 @@ func (r *Router) penalize(ctx context.Context, conn *model.Connection, apiErr *A
 
 	switch apiErr.Upstream {
 	case http.StatusTooManyRequests:
-		cooldown = 60 * time.Second
+		// OmniRoute's accountFallback.ts:202-204 spells this out: the
+		// generic "Resource has been exhausted (e.g. check quota)"
+		// phrasing is Gemini's transient RPM/TPM rate-limit body, not
+		// a depleted quota. Real quota-exhaustion uses more specific
+		// phrasings ("tier has been exhausted", "insufficient credits",
+		// "exceeded your current usage quota", etc.) and is matched by
+		// antigravityQuotaExhausted in upstream_antigravity.go. Here we
+		// tell them apart so the transient flavour cools the connection
+		// for 10 s (next per-minute bucket) instead of 60 s, and the
+		// terminal flavour gets the longer cool-down so the router
+		// fails over to another account.
+		lowerMessage := strings.ToLower(apiErr.Message)
+		if antigravityQuotaExhausted(lowerMessage) {
+			cooldown = 5 * time.Minute
+		} else if strings.Contains(lowerMessage, "resource has been exhausted") ||
+			strings.Contains(lowerMessage, "resource_exhausted") ||
+			strings.Contains(lowerMessage, "rate limit") ||
+			strings.Contains(lowerMessage, "rate_limit") ||
+			strings.Contains(lowerMessage, "too many requests") {
+			// Transient per-minute RPM/TPM limit. Short cooldown so
+			// the next proxied request has a chance to land in the
+			// next per-minute bucket.
+			cooldown = 10 * time.Second
+		} else {
+			cooldown = 60 * time.Second
+		}
 		if seconds := retryAfterSeconds(apiErr.Message); seconds > 0 {
 			cooldown = time.Duration(seconds) * time.Second
 		}

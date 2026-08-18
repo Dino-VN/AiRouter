@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -173,18 +174,85 @@ func (e *antigravityExecutor) send(ctx context.Context, conn *model.Connection, 
 			)
 		}
 
-		// Cloud Code 403 with "has not been used in project …"
-		// means the project id we just sent is stale: Google
-		// disabled the API on it, deleted it, or the IDE
-		// re-onboarded the account to a different project
-		// since we last looked. Force a fresh onboard via
-		// EnsureProjectID (which calls loadCodeAssist again
-		// and, when that returns nothing, provisions a new
-		// project through onboardUser), then retry the
-		// request once with the new project id. A second 403
-		// with the same shape is allowed to surface — we do
-		// not loop.
-		if resp.StatusCode == http.StatusForbidden &&
+		// Cloud Code 429 with "Resource has been exhausted (e.g. check
+		// quota)" is a transient RPM/TPM rate limit, NOT a depleted
+		// quota. OmniRoute's accountFallback.ts:203-204 calls this out
+		// explicitly: the generic "has been exhausted" phrasing must
+		// stay RATE_LIMIT_EXCEEDED because it appears in Gemini's
+		// per-minute 429 body. Real quota-exhaustion wording uses
+		// "tier has been exhausted", "exceeded your current usage
+		// quota", "credit_balance_too_low", "insufficient credits",
+		// etc. (see CREDITS_EXHAUSTED_SIGNALS).
+		//
+		// Treat the transient flavour as such: wait a short backoff
+		// (2-4 s) and retry the same connection once. If the second
+		// attempt also 429s with the same shape, surface the error
+		// with a short cooldown (10 s instead of the router's default
+		// 60 s) so the next proxied request has a chance to land in
+		// the next per-minute bucket.
+		if resp.StatusCode == http.StatusTooManyRequests &&
+			antigravityTransientRateLimit(body) && !opts.RetryedProjectRoute {
+			// Wait a short backoff. The request context is the one
+			// the client gave us, so honour cancellation but do not
+			// bound the wait on it alone — a 1-second context would
+			// defeat the retry.
+			select {
+			case <-ctx.Done():
+				return nil, asAPIError(model.ProviderAntigravity, ctx.Err())
+			case <-time.After(3 * time.Second):
+			}
+			// Rebuild the envelope (sessionId must be unique per
+			// attempt; otherwise Google dedupes the second request
+			// as a replay of the first).
+			body2, bodyErr := wrapAntigravityRequest(req.Model, conn.ProjectID, inner, opts.Raw)
+			if bodyErr != nil {
+				return nil, asAPIError(model.ProviderAntigravity, bodyErr)
+			}
+			retryReq, retryErr := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body2))
+			if retryErr != nil {
+				return nil, asAPIError(model.ProviderAntigravity, retryErr)
+			}
+			retryReq.Header.Set("Content-Type", "application/json")
+			retryReq.Header.Set("Authorization", "Bearer "+cred.AccessToken)
+			if agent, ok := e.vendor.(userAgentProvider); ok {
+				retryReq.Header.Set("User-Agent", agent.UserAgent(ctx))
+			}
+			retryReq.Header.Set("X-Goog-Api-Client", "gl-node/22.21.1")
+			if conn.ProjectID != "" {
+				retryReq.Header.Set("X-Goog-User-Project", conn.ProjectID)
+			}
+			if req.Stream {
+				retryReq.Header.Set("Accept", "text/event-stream")
+			} else {
+				retryReq.Header.Set("Accept", "application/json")
+			}
+			if e.debug {
+				e.logDebug("antigravity upstream retry after 429 transient",
+					"connection", conn.ID,
+					"project_id", conn.ProjectID,
+					"request_body", truncateForLog(string(body2), 16*1024),
+				)
+			}
+			retryResp, retryErr := e.client.Do(retryReq)
+			if retryErr != nil {
+				return nil, asAPIError(model.ProviderAntigravity, retryErr)
+			}
+			if retryResp.StatusCode < 200 || retryResp.StatusCode > 299 {
+				defer retryResp.Body.Close()
+				retryBody := readErrorBody(retryResp.Body)
+				if e.debug {
+					e.logDebug("antigravity upstream retry also failed",
+						"connection", conn.ID,
+						"status", retryResp.StatusCode,
+						"error_body", truncateForLog(string(retryBody), 16*1024),
+					)
+				}
+				return nil, apiErrorFromResponse(model.ProviderAntigravity,
+					retryResp.StatusCode, retryResp.Header, retryBody)
+			}
+			resp = retryResp
+			opts.RetryedProjectRoute = true
+		} else if resp.StatusCode == http.StatusForbidden &&
 			antigravityProjectRouteError(body) && !opts.RetryedProjectRoute {
 			if ensurer, ok := e.vendor.(antigravityProjectEnsurer); ok {
 				e.log.Info("antigravity: 403 project-route error; refreshing project id and retrying once",
@@ -548,4 +616,72 @@ func truncateForLog(s string, limit int) string {
 		return s
 	}
 	return s[:limit] + "…"
+}
+
+// antigravityTransientRateLimit reports whether body is the Cloud Code
+// 429 that means "transient per-minute RPM/TPM rate limit", as opposed
+// to "depleted quota". OmniRoute's accountFallback.ts:202-204 spells
+// the distinction out:
+//
+//	"narrower than a bare 'has been exhausted' — that generic phrase also
+//	appears in Gemini's transient RPM/TPM 429 body ('Resource has been
+//	exhausted (e.g. check quota).'), which must stay RATE_LIMIT_EXCEEDED,
+//	not terminal."
+//
+// Real quota exhaustion uses the more specific phrasings matched by
+// antigravityQuotaExhausted below; everything else that says "Resource
+// has been exhausted" / "RESOURCE_EXHAUSTED" / "rate limit" is treated
+// as transient and retried with a short backoff before failing the
+// request.
+func antigravityTransientRateLimit(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	text := strings.ToLower(string(body))
+	if antigravityQuotaExhausted(text) {
+		return false
+	}
+	return strings.Contains(text, "resource has been exhausted") ||
+		strings.Contains(text, "resource_exhausted") ||
+		strings.Contains(text, "rate limit") ||
+		strings.Contains(text, "rate_limit") ||
+		strings.Contains(text, "too many requests") ||
+		strings.Contains(text, "per minute") ||
+		strings.Contains(text, "rpm") ||
+		strings.Contains(text, "try again")
+}
+
+// antigravityQuotaExhausted reports whether body carries one of the
+// specific signals OmniRoute (accountFallback.ts CREDITS_EXHAUSTED_SIGNALS)
+// uses to mark an account as terminal-credits-exhausted. These are
+// per-day / per-month quota depletions (or paid-tier credit
+// depletions) — the connection should be cooled down for a long
+// time and the router should fail over to another account, not
+// retry the same one.
+func antigravityQuotaExhausted(loweredBody string) bool {
+	if loweredBody == "" {
+		return false
+	}
+	return strings.Contains(loweredBody, "exceeded your current usage quota") ||
+		strings.Contains(loweredBody, "credit_balance_too_low") ||
+		strings.Contains(loweredBody, "your credit balance is too low") ||
+		strings.Contains(loweredBody, "credits exhausted") ||
+		strings.Contains(loweredBody, "out of credits") ||
+		strings.Contains(loweredBody, "payment required") ||
+		strings.Contains(loweredBody, "free tier of the model has been exhausted") ||
+		strings.Contains(loweredBody, "tier has been exhausted") ||
+		strings.Contains(loweredBody, "insufficient balance") ||
+		strings.Contains(loweredBody, "insufficient_balance") ||
+		strings.Contains(loweredBody, "insufficient account balance") ||
+		strings.Contains(loweredBody, "insufficient credit balance") ||
+		strings.Contains(loweredBody, "insufficient credits") ||
+		strings.Contains(loweredBody, "insufficient credit") ||
+		strings.Contains(loweredBody, "quota_exhausted") ||
+		strings.Contains(loweredBody, "quota exhausted") ||
+		strings.Contains(loweredBody, "quota reached") ||
+		strings.Contains(loweredBody, "enable overages") ||
+		strings.Contains(loweredBody, "individual quota") ||
+		strings.Contains(loweredBody, "daily limit") ||
+		strings.Contains(loweredBody, "exhausted your capacity") ||
+		strings.Contains(loweredBody, "free tier")
 }
