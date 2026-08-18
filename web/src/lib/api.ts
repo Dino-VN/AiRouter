@@ -18,13 +18,17 @@ import type {
   CreateConnectionResponse,
   CreateKeyResponse,
   CreateUserResponse,
+  CreateOpenAIEndpointRequest,
+  AddOpenAIKeyRequest,
   KeysResponse,
   MeResponse,
   Meta,
   OAuthSessionsResponse,
+  OpenAIEndpoint,
   ProviderInfo,
   Quota,
   QuotaResponse,
+  ScanOpenAIModelsResponse,
   Scope,
   StartOAuthResponse,
   UpstreamQuota,
@@ -288,6 +292,26 @@ export const api = {
 
   providers: () => get<{ providers: ProviderInfo[] }>("/api/providers"),
   models: () => get<CatalogResponse>("/api/models"),
+
+  /** OpenAI-compatible endpoints. Each "endpoint" is a profile identified
+   *  by its base URL; a profile can hold any number of API keys (each
+   *  key is its own connection row grouped by base_url). The handlers
+   *  here are the REST surface the /providers page drives. */
+  openai: {
+    list: () => get<{ endpoints: OpenAIEndpoint[] | null }>("/api/openai/endpoints"),
+    create: (body: CreateOpenAIEndpointRequest) =>
+      post<CreateConnectionResponse>("/api/openai/endpoints", body),
+    addKey: (baseURL: string, body: AddOpenAIKeyRequest) =>
+      post<CreateConnectionResponse>(
+        `/api/openai/endpoints/${encodeURIComponent(baseURL)}/keys`,
+        body
+      ),
+    scanModels: (baseURL: string, apiKey?: string) =>
+      get<ScanOpenAIModelsResponse>(
+        `/api/openai/endpoints/${encodeURIComponent(baseURL)}/models`,
+        apiKey ? { api_key: apiKey } : undefined
+      ),
+  },
 
   connections: {
     list: (query?: ConnectionQuery) =>

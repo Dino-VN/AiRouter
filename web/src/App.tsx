@@ -7,6 +7,7 @@ import { useAuth } from "@/context/auth"
 import AdminOverviewPage from "@/pages/admin-overview"
 import ApiKeysPage from "@/pages/api-keys"
 import ProvidersPage from "@/pages/providers"
+import ProviderDetailPage from "@/pages/provider-detail"
 import DashboardPage from "@/pages/dashboard"
 import LoginPage from "@/pages/login"
 import NotFoundPage from "@/pages/not-found"
@@ -69,7 +70,7 @@ export function App() {
       >
         <Route path="/" element={<DashboardPage />} />
         <Route path="/providers" element={<ProvidersPage />} />
-        <Route path="/providers/:provider" element={<ProvidersPage />} />
+        <Route path="/providers/:provider" element={<ProviderDetailPage />} />
         <Route path="/connections" element={<ProvidersPage />} />
         <Route path="/keys" element={<ApiKeysPage />} />
         <Route path="/usage" element={<UsagePage />} />

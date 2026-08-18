@@ -13,8 +13,8 @@ import (
 )
 
 const connectionColumns = `c.id, c.owner_id, c.provider, c.label, c.account_email, c.account_id,
-	c.project_id, c.plan, c.status, c.scope, c.weight, c.metadata, c.quota, c.quota_updated_at,
-	c.disabled_until, c.last_error, c.last_used_at, c.token_expires_at, c.created_at, c.updated_at`
+        c.project_id, c.plan, c.status, c.scope, c.weight, c.metadata, c.quota, c.quota_updated_at,
+        c.disabled_until, c.last_error, c.last_used_at, c.token_expires_at, c.created_at, c.updated_at`
 
 // ConnectionFilter narrows a connection listing.
 type ConnectionFilter struct {
@@ -25,6 +25,11 @@ type ConnectionFilter struct {
 	IncludeShared bool
 	// Provider limits results to a single provider when non-empty.
 	Provider model.Provider
+	// BaseURL limits results to OpenAI-compatible connections whose
+	// metadata.base_url matches. The filter is only meaningful for
+	// ProviderOpenAI; for OAuth providers it is ignored. Comparisons are
+	// case-insensitive and trailing slashes are normalised away.
+	BaseURL string
 	// UsableOnly drops disabled or cooling-down connections.
 	UsableOnly bool
 }
@@ -54,10 +59,10 @@ func (s *Store) CreateConnection(ctx context.Context, conn *model.Connection, cr
 	}
 
 	row := s.pool.QueryRow(ctx, `
-		INSERT INTO connections (id, owner_id, provider, label, account_email, account_id, project_id,
-		                         plan, status, scope, weight, secret, metadata, token_expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-		RETURNING created_at, updated_at`,
+                INSERT INTO connections (id, owner_id, provider, label, account_email, account_id, project_id,
+                                         plan, status, scope, weight, secret, metadata, token_expires_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                RETURNING created_at, updated_at`,
 		conn.ID, conn.OwnerID, string(conn.Provider), conn.Label, strings.ToLower(conn.AccountEmail),
 		conn.AccountID, conn.ProjectID, conn.Plan, conn.Status, conn.Scope, conn.Weight,
 		sealed, metadata, conn.TokenExpiresAt)
@@ -71,9 +76,9 @@ func (s *Store) CreateConnection(ctx context.Context, conn *model.Connection, cr
 // GetConnection loads one connection including its decrypted credential.
 func (s *Store) GetConnection(ctx context.Context, id uuid.UUID) (*model.Connection, error) {
 	row := s.pool.QueryRow(ctx, `
-		SELECT `+connectionColumns+`, u.username, c.secret
-		FROM connections c JOIN users u ON u.id = c.owner_id
-		WHERE c.id = $1`, id)
+                SELECT `+connectionColumns+`, u.username, c.secret
+                FROM connections c JOIN users u ON u.id = c.owner_id
+                WHERE c.id = $1`, id)
 
 	conn, sealed, err := scanConnectionWithSecret(row)
 	if err != nil {
@@ -106,18 +111,29 @@ func (s *Store) ListConnections(ctx context.Context, filter ConnectionFilter) ([
 		args = append(args, string(filter.Provider))
 		next++
 	}
+	if filter.BaseURL != "" {
+		// metadata is a jsonb column. The cast ->> 'base_url' pulls the field
+		// out as text; lower(...) = lower(...) makes the match case-insensitive
+		// and trim_trailing '/' normalises away the trailing slash so
+		// "https://api.openai.com/v1/" and "https://api.openai.com/v1" match.
+		where = append(where, fmt.Sprintf(
+			"trim(trailing '/' from lower((c.metadata ->> 'base_url'))) = trim(trailing '/' from lower($%d))",
+			next))
+		args = append(args, filter.BaseURL)
+		next++
+	}
 	if filter.UsableOnly {
 		where = append(where, "c.status <> 'disabled'")
 		where = append(where, "(c.disabled_until IS NULL OR c.disabled_until <= now())")
 	}
 
 	query := `
-		SELECT ` + connectionColumns + `, u.username,
-		       COALESCE((SELECT count(*) FROM usage_records ur
-		                 WHERE ur.connection_id = c.id AND ur.created_at > now() - interval '24 hours'), 0)
-		FROM connections c JOIN users u ON u.id = c.owner_id
-		WHERE ` + strings.Join(where, " AND ") + `
-		ORDER BY c.provider, c.created_at`
+                SELECT ` + connectionColumns + `, u.username,
+                       COALESCE((SELECT count(*) FROM usage_records ur
+                                 WHERE ur.connection_id = c.id AND ur.created_at > now() - interval '24 hours'), 0)
+                FROM connections c JOIN users u ON u.id = c.owner_id
+                WHERE ` + strings.Join(where, " AND ") + `
+                ORDER BY c.provider, c.created_at`
 
 	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
@@ -145,13 +161,13 @@ func (s *Store) SelectCandidates(ctx context.Context, ownerID uuid.UUID, provide
 		ownership = "(c.owner_id = $1 OR c.scope = 'shared')"
 	}
 	query := `
-		SELECT ` + connectionColumns + `, u.username, c.secret
-		FROM connections c JOIN users u ON u.id = c.owner_id
-		WHERE ` + ownership + `
-		  AND c.provider = $2
-		  AND c.status <> 'disabled'
-		  AND (c.disabled_until IS NULL OR c.disabled_until <= now())
-		ORDER BY c.last_used_at ASC NULLS FIRST, c.created_at ASC`
+                SELECT ` + connectionColumns + `, u.username, c.secret
+                FROM connections c JOIN users u ON u.id = c.owner_id
+                WHERE ` + ownership + `
+                  AND c.provider = $2
+                  AND c.status <> 'disabled'
+                  AND (c.disabled_until IS NULL OR c.disabled_until <= now())
+                ORDER BY c.last_used_at ASC NULLS FIRST, c.created_at ASC`
 
 	rows, err := s.pool.Query(ctx, query, ownerID, string(provider))
 	if err != nil {
@@ -190,9 +206,9 @@ func (s *Store) CountConnections(ctx context.Context, ownerID uuid.UUID) (int, e
 // account, used to refresh instead of duplicating on re-login.
 func (s *Store) FindConnectionByAccount(ctx context.Context, ownerID uuid.UUID, provider model.Provider, accountEmail string) (*model.Connection, error) {
 	row := s.pool.QueryRow(ctx, `
-		SELECT `+connectionColumns+`, u.username, c.secret
-		FROM connections c JOIN users u ON u.id = c.owner_id
-		WHERE c.owner_id = $1 AND c.provider = $2 AND lower(c.account_email) = lower($3)`,
+                SELECT `+connectionColumns+`, u.username, c.secret
+                FROM connections c JOIN users u ON u.id = c.owner_id
+                WHERE c.owner_id = $1 AND c.provider = $2 AND lower(c.account_email) = lower($3)`,
 		ownerID, string(provider), accountEmail)
 
 	conn, sealed, err := scanConnectionWithSecret(row)
@@ -329,18 +345,18 @@ func (s *Store) MarkConnectionError(ctx context.Context, id uuid.UUID, message s
 		until = &t
 	}
 	_, err := s.pool.Exec(ctx, `
-		UPDATE connections
-		SET last_error = $2, status = $3, disabled_until = $4, updated_at = now()
-		WHERE id = $1`, id, truncate(message, 2000), status, until)
+                UPDATE connections
+                SET last_error = $2, status = $3, disabled_until = $4, updated_at = now()
+                WHERE id = $1`, id, truncate(message, 2000), status, until)
 	return mapErr(err)
 }
 
 // ClearConnectionError marks a connection healthy again.
 func (s *Store) ClearConnectionError(ctx context.Context, id uuid.UUID) error {
 	_, err := s.pool.Exec(ctx, `
-		UPDATE connections
-		SET last_error = '', status = 'active', disabled_until = NULL, updated_at = now()
-		WHERE id = $1 AND status <> 'disabled'`, id)
+                UPDATE connections
+                SET last_error = '', status = 'active', disabled_until = NULL, updated_at = now()
+                WHERE id = $1 AND status <> 'disabled'`, id)
 	return mapErr(err)
 }
 
@@ -351,8 +367,8 @@ func (s *Store) UpdateConnectionQuota(ctx context.Context, id uuid.UUID, quota *
 		return err
 	}
 	_, err = s.pool.Exec(ctx, `
-		UPDATE connections SET quota = $2, quota_updated_at = now(), updated_at = now()
-		WHERE id = $1`, id, payload)
+                UPDATE connections SET quota = $2, quota_updated_at = now(), updated_at = now()
+                WHERE id = $1`, id, payload)
 	return mapErr(err)
 }
 

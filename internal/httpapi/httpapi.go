@@ -125,6 +125,15 @@ func (s *Server) route(mux *http.ServeMux) {
 	mux.Handle("GET /api/providers", s.user(s.json(s.listProviders)))
 	mux.Handle("GET /api/models", s.user(s.json(s.listCatalog)))
 
+	// OpenAI-compatible endpoints: a "provider profile" with its own base
+	// URL plus one or more API keys. Each profile is stored as a connection
+	// row with provider=openai and a metadata.base_url; multiple keys per
+	// base URL are separate connection rows grouped by base_url.
+	mux.Handle("GET /api/openai/endpoints", s.user(s.json(s.listOpenAIEndpoints)))
+	mux.Handle("POST /api/openai/endpoints", s.user(s.json(s.createOpenAIEndpoint)))
+	mux.Handle("GET /api/openai/endpoints/{base_url}/models", s.user(s.json(s.scanOpenAIModels)))
+	mux.Handle("POST /api/openai/endpoints/{base_url}/keys", s.user(s.json(s.addOpenAIKey)))
+
 	mux.Handle("GET /api/connections", s.user(s.json(s.listConnections)))
 	mux.Handle("POST /api/connections", s.user(s.json(s.createAPIKeyConnection)))
 	mux.Handle("GET /api/connections/{id}", s.user(s.json(s.getConnection)))

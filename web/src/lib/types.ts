@@ -254,6 +254,61 @@ export type CreateConnectionResponse = {
   connection: Connection
 }
 
+// ---------------------------------------------------------------------------
+// OpenAI-compatible endpoints (grouped by base URL)
+// ---------------------------------------------------------------------------
+
+export type OpenAIEndpointKey = {
+  id: string
+  label: string
+  account_email: string
+  plan?: string
+  status: ConnectionStatus
+  scope: Scope
+  weight: number
+  disabled_until?: string
+  last_error?: string
+  last_used_at?: string
+  request_count_24h?: number
+  has_api_key: boolean
+  quota_note?: string
+  extra_headers_keys?: string[]
+}
+
+export type OpenAIEndpoint = {
+  base_url: string
+  label: string
+  models?: string[]
+  keys: OpenAIEndpointKey[]
+  created_at: string
+  usable_count: number
+  key_count: number
+}
+
+export type CreateOpenAIEndpointRequest = {
+  label: string
+  base_url: string
+  api_key?: string
+  models?: string[]
+  extra_headers?: Record<string, string>
+  quota_note?: string
+  scope?: Scope
+  weight?: number
+}
+
+export type AddOpenAIKeyRequest = {
+  label: string
+  api_key: string
+  scope?: Scope
+  weight?: number
+}
+
+export type ScanOpenAIModelsResponse = {
+  base_url: string
+  models: string[]
+  count: number
+}
+
 export type CatalogResponse = {
   // Nullable like every other list in this file: an older server, or one whose
   // catalog has not been fetched yet, sends null rather than [].

@@ -121,6 +121,13 @@ func (s *Server) listConnections(w http.ResponseWriter, r *http.Request) *apiErr
 		}
 		filter.Provider = id
 	}
+	// base_url filter applies to OpenAI-compatible connections only. It is
+	// ignored for OAuth providers so callers can ask for "all openai keys
+	// against this endpoint" without surprising themselves when the filter
+	// would otherwise silently drop every Codex/Antigravity row.
+	if raw := strings.TrimSpace(r.URL.Query().Get("base_url")); raw != "" {
+		filter.BaseURL = raw
+	}
 
 	conns, err := s.store.ListConnections(r.Context(), filter)
 	if err != nil {
