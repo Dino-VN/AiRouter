@@ -23,9 +23,14 @@ import (
 const (
 	codexAuthURL     = "https://auth.openai.com/oauth/authorize"
 	codexTokenURL    = "https://auth.openai.com/oauth/token"
-	codexClientID    = "app_EMoamEEZ73f0CkXaXp7hrann"
 	codexRedirectURI = "http://localhost:1455/auth/callback"
 	codexScope       = "openid email profile offline_access"
+
+	// codexClientID is resolved at call time from public_creds.go so
+	// operators can override it via AIHUB_CODEX_OAUTH_CLIENT_ID (e.g.
+	// to point Codex at an internal mirror without forking the binary).
+	// The default is the public OpenAI Auth0 client id the Codex CLI
+	// itself ships — the same value OmniRoute embeds.
 
 	// codexLoopbackPort is the only port the OAuth client will redirect to.
 	codexLoopbackPort  = 1455
@@ -70,7 +75,7 @@ func (p *codexProvider) BeginAuth(_ context.Context, opts AuthOptions) (*AuthReq
 
 	challenge := sha256.Sum256([]byte(verifier))
 	params := url.Values{
-		"client_id":                  {codexClientID},
+		"client_id":                  {codexOAuthClientID()},
 		"response_type":              {"code"},
 		"redirect_uri":               {redirect},
 		"scope":                      {codexScope},
@@ -101,7 +106,7 @@ func (p *codexProvider) CompleteAuth(ctx context.Context, sess *model.OAuthSessi
 	}
 	form := url.Values{
 		"grant_type":    {"authorization_code"},
-		"client_id":     {codexClientID},
+		"client_id":     {codexOAuthClientID()},
 		"code":          {code},
 		"redirect_uri":  {redirect},
 		"code_verifier": {sess.CodeVerifier},
@@ -119,7 +124,7 @@ func (p *codexProvider) Refresh(ctx context.Context, cred *model.Credential) (*A
 		return nil, fmt.Errorf("%w: no refresh token stored", ErrCredentialRevoked)
 	}
 	form := url.Values{
-		"client_id":     {codexClientID},
+		"client_id":     {codexOAuthClientID()},
 		"grant_type":    {"refresh_token"},
 		"refresh_token": {cred.RefreshToken},
 		"scope":         {"openid profile email"},

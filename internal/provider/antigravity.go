@@ -20,9 +20,12 @@ import (
 
 // Antigravity reuses Google's installed-application OAuth client shipped with
 // the Antigravity IDE, so the redirect must stay on its fixed loopback port.
+// The client_id and client_secret are public values embedded in the Antigravity
+// IDE binary; they are resolved from internal/provider/public_creds.go so
+// operators can override them via AIHUB_ANTIGRAVITY_OAUTH_CLIENT_ID and
+// AIHUB_ANTIGRAVITY_OAUTH_CLIENT_SECRET (e.g. to point Antigravity at an
+// internal mirror without forking the binary).
 const (
-	antigravityClientID     = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
-	antigravityClientSecret = "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"
 	antigravityLoopbackPort = 51121
 	antigravityCallbackPath = "/oauth-callback"
 	antigravityRedirectURI  = "http://localhost:51121/oauth-callback"
@@ -86,7 +89,7 @@ func (p *antigravityProvider) BeginAuth(_ context.Context, opts AuthOptions) (*A
 
 	params := url.Values{
 		"access_type":   {"offline"},
-		"client_id":     {antigravityClientID},
+		"client_id":     {antigravityOAuthClientID()},
 		"prompt":        {"consent"},
 		"redirect_uri":  {redirect},
 		"response_type": {"code"},
@@ -112,8 +115,8 @@ func (p *antigravityProvider) CompleteAuth(ctx context.Context, sess *model.OAut
 	}
 	form := url.Values{
 		"code":          {code},
-		"client_id":     {antigravityClientID},
-		"client_secret": {antigravityClientSecret},
+		"client_id":     {antigravityOAuthClientID()},
+		"client_secret": {antigravityOAuthClientSecret()},
 		"redirect_uri":  {redirect},
 		"grant_type":    {"authorization_code"},
 	}
@@ -158,8 +161,8 @@ func (p *antigravityProvider) Refresh(ctx context.Context, cred *model.Credentia
 		return nil, fmt.Errorf("%w: no refresh token stored", ErrCredentialRevoked)
 	}
 	form := url.Values{
-		"client_id":     {antigravityClientID},
-		"client_secret": {antigravityClientSecret},
+		"client_id":     {antigravityOAuthClientID()},
+		"client_secret": {antigravityOAuthClientSecret()},
 		"refresh_token": {cred.RefreshToken},
 		"grant_type":    {"refresh_token"},
 	}
