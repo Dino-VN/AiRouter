@@ -56,7 +56,14 @@ export default function ProvidersPage() {
   const providers = view.data?.providers.providers ?? []
   const endpoints = view.data?.openai.endpoints ?? []
 
-  const oauthProviders = providers.filter((p) => p.oauth)
+  // OAuth providers: Codex is always visible (it's the default upstream);
+  // Antigravity auto-hides when the caller has no Antigravity connection
+  // yet, so the launcher does not advertise a sign-in flow the operator
+  // has no use for. There is no toggle — the card comes back on its own
+  // the moment an Antigravity account is attached from another route.
+  const oauthProviders = providers.filter(
+    (p) => p.oauth && (p.id !== "antigravity" || p.connections > 0)
+  )
   const openAIProvider = providers.find((p) => p.id === "openai")
 
   return (
