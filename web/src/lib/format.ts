@@ -171,6 +171,8 @@ export function providerLabel(id: string): string {
       return "Codex"
     case "antigravity":
       return "Antigravity"
+    case "openai":
+      return "OpenAI API"
     default:
       return id
   }

@@ -33,7 +33,7 @@ type NavItem = {
 
 const NAV: NavItem[] = [
   { to: "/", label: "Overview", icon: LayoutDashboardIcon, end: true },
-  { to: "/connections", label: "Connections", icon: PlugZapIcon },
+  { to: "/providers", label: "Providers", icon: PlugZapIcon },
   { to: "/keys", label: "API keys", icon: KeyRoundIcon },
   { to: "/usage", label: "Usage", icon: ActivityIcon },
   { to: "/quota", label: "Quota", icon: GaugeIcon },

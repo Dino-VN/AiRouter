@@ -36,13 +36,32 @@ const (
 	ProviderCodex Provider = "codex"
 	// ProviderAntigravity is a Google Antigravity OAuth account.
 	ProviderAntigravity Provider = "antigravity"
+	// ProviderOpenAI is a custom OpenAI-compatible API endpoint
+	// authenticated with an API key rather than an OAuth flow. Operators
+	// register the base URL (e.g. https://api.openai.com/v1, or any
+	// OpenAI-compatible gateway), the API key, and the model list they
+	// want to expose; the proxy forwards chat-completions and responses
+	// requests verbatim, so this provider works against OpenAI itself,
+	// Azure OpenAI, OpenRouter, vLLM, LocalAI, Ollama's OpenAI shim, etc.
+	ProviderOpenAI Provider = "openai"
 )
 
 // Valid reports whether p is a provider this build supports.
-func (p Provider) Valid() bool { return p == ProviderCodex || p == ProviderAntigravity }
+func (p Provider) Valid() bool {
+	return p == ProviderCodex || p == ProviderAntigravity || p == ProviderOpenAI
+}
 
 // Providers lists every supported provider.
-func Providers() []Provider { return []Provider{ProviderCodex, ProviderAntigravity} }
+func Providers() []Provider {
+	return []Provider{ProviderCodex, ProviderAntigravity, ProviderOpenAI}
+}
+
+// IsOAuth reports whether a provider uses the OAuth refresh flow. The proxy and
+// store layer use this to skip token refresh, loopback listeners, and OAuth
+// sessions for API-key providers like ProviderOpenAI.
+func (p Provider) IsOAuth() bool {
+	return p == ProviderCodex || p == ProviderAntigravity
+}
 
 // Connection scopes.
 const (

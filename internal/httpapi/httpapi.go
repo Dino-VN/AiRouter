@@ -126,6 +126,7 @@ func (s *Server) route(mux *http.ServeMux) {
 	mux.Handle("GET /api/models", s.user(s.json(s.listCatalog)))
 
 	mux.Handle("GET /api/connections", s.user(s.json(s.listConnections)))
+	mux.Handle("POST /api/connections", s.user(s.json(s.createAPIKeyConnection)))
 	mux.Handle("GET /api/connections/{id}", s.user(s.json(s.getConnection)))
 	mux.Handle("PATCH /api/connections/{id}", s.user(s.json(s.patchConnection)))
 	mux.Handle("DELETE /api/connections/{id}", s.user(s.json(s.deleteConnection)))

@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html"
@@ -47,7 +48,7 @@ func (s *Server) listProviders(w http.ResponseWriter, r *http.Request) *apiError
 	}
 
 	catalog := s.registry.Catalog()
-	out := make([]map[string]any, 0, 2)
+	out := make([]map[string]any, 0, len(s.registry.All()))
 	for _, vendor := range s.registry.All() {
 		id := vendor.ID()
 		out = append(out, map[string]any{
@@ -61,6 +62,11 @@ func (s *Server) listProviders(w http.ResponseWriter, r *http.Request) *apiError
 			"usable":        usable[id],
 			"models":        len(catalog.ForProvider(id)),
 			"auto_callback": s.cfg != nil && s.cfg.EnableLocalOAuthListeners,
+			// "oauth" is true when the provider authenticates via an OAuth flow
+			// (Codex, Antigravity). API-key providers (ProviderOpenAI) report
+			// false here so the UI knows to skip the consent-screen flow and
+			// show the API-key form instead.
+			"oauth": id.IsOAuth(),
 		})
 	}
 
@@ -143,6 +149,156 @@ func (s *Server) getConnection(w http.ResponseWriter, r *http.Request) *apiError
 		"has_refresh":    conn.Credential != nil && conn.Credential.RefreshToken != "",
 		"last_refreshed": credentialRefreshedAt(conn),
 	})
+	return nil
+}
+
+// createAPIKeyConnection stores an API-key based connection (ProviderOpenAI
+// today; any future provider where IsOAuth() returns false lands here too).
+//
+// The body carries:
+//
+//   - provider:        "openai" (the only API-key provider this build ships)
+//   - label:           human-readable handle shown in the UI
+//   - api_key:         the bearer credential sent upstream
+//   - base_url:        optional override (defaults to https://api.openai.com/v1)
+//   - plan:            optional plan tag (e.g. "paygo", "scale")
+//   - account_email:   optional email for display only
+//   - scope:           "private" (default) or "shared" (admin only)
+//   - weight:          optional, 1-100, defaults to 1
+//   - models:          optional curated list of model ids this gateway serves
+//   - extra_headers:   optional map of vendor-specific headers (e.g.
+//     {"OpenAI-Beta": "assistants=v2", "Helicone-Auth": "..."})
+//   - quota_note:      optional note that overrides the default quota message
+//
+// Returns the created connection (with the credential stripped, as everywhere
+// else in this API).
+func (s *Server) createAPIKeyConnection(w http.ResponseWriter, r *http.Request) *apiError {
+	caller := callerFrom(r.Context())
+
+	var body struct {
+		Provider     string            `json:"provider"`
+		Label        string            `json:"label"`
+		APIKey       string            `json:"api_key"`
+		BaseURL      string            `json:"base_url"`
+		Plan         string            `json:"plan"`
+		AccountEmail string            `json:"account_email"`
+		Scope        string            `json:"scope"`
+		Weight       *int              `json:"weight"`
+		Models       []string          `json:"models"`
+		ExtraHeaders map[string]string `json:"extra_headers"`
+		QuotaNote    string            `json:"quota_note"`
+	}
+	if apiErr := decodeJSON(r, &body); apiErr != nil {
+		return apiErr
+	}
+
+	providerID := model.Provider(strings.ToLower(trim(body.Provider)))
+	if !providerID.Valid() {
+		return invalid(map[string]string{"provider": "must be codex, antigravity, or openai"})
+	}
+	if providerID.IsOAuth() {
+		return invalid(map[string]string{"provider": string(providerID) + " uses OAuth; start a sign-in via POST /api/oauth/sessions instead"})
+	}
+	apiKey := strings.TrimSpace(body.APIKey)
+	if apiKey == "" {
+		return invalid(map[string]string{"api_key": "is required"})
+	}
+	label := trim(body.Label)
+	if label == "" {
+		return invalid(map[string]string{"label": "must not be empty"})
+	}
+
+	quota, err := s.store.GetQuota(r.Context(), caller.User.ID)
+	if err != nil {
+		return storeError(err, "load quota")
+	}
+	if !providerAllowed(quota, providerID) {
+		return errorf(http.StatusForbidden, "provider_not_allowed",
+			"your account is not allowed to use %s", providerID)
+	}
+	if quota.MaxConnections > 0 {
+		count, countErr := s.store.CountConnections(r.Context(), caller.User.ID)
+		if countErr != nil {
+			return storeError(countErr, "count connections")
+		}
+		if count >= quota.MaxConnections {
+			return errorf(http.StatusConflict, "connection_limit",
+				"you already have %d of %d allowed connections; remove one first",
+				count, quota.MaxConnections)
+		}
+	}
+
+	scope := strings.ToLower(trim(body.Scope))
+	switch scope {
+	case "":
+		scope = model.ScopePrivate
+	case model.ScopePrivate:
+	case model.ScopeShared:
+		if !caller.User.IsAdmin() {
+			return errorf(http.StatusForbidden, "forbidden", "only an admin can share a connection")
+		}
+	default:
+		return invalid(map[string]string{"scope": "must be private or shared"})
+	}
+
+	weight := 1
+	if body.Weight != nil {
+		weight = *body.Weight
+		if weight < 1 || weight > 100 {
+			return invalid(map[string]string{"weight": "must be between 1 and 100"})
+		}
+	}
+
+	metadata := map[string]any{}
+	if base := strings.TrimRight(trim(body.BaseURL), "/"); base != "" {
+		metadata["base_url"] = base
+	}
+	if len(body.Models) > 0 {
+		cleaned := make([]any, 0, len(body.Models))
+		for _, m := range body.Models {
+			if id := strings.TrimSpace(m); id != "" {
+				cleaned = append(cleaned, id)
+			}
+		}
+		if len(cleaned) > 0 {
+			metadata["models"] = cleaned
+		}
+	}
+	if len(body.ExtraHeaders) > 0 {
+		// Round-trip via JSON so the store sees a plain map[string]any, which
+		// is what the executor expects when it pulls operator-configured
+		// headers back out of Metadata.
+		raw, _ := json.Marshal(body.ExtraHeaders)
+		var asAny map[string]any
+		_ = json.Unmarshal(raw, &asAny)
+		if len(asAny) > 0 {
+			metadata["extra_headers"] = asAny
+		}
+	}
+	if note := strings.TrimSpace(body.QuotaNote); note != "" {
+		metadata["quota_note"] = note
+	}
+
+	conn := &model.Connection{
+		OwnerID:      caller.User.ID,
+		Provider:     providerID,
+		Label:        label,
+		AccountEmail: strings.ToLower(strings.TrimSpace(body.AccountEmail)),
+		Plan:         trim(body.Plan),
+		Status:       model.ConnStatusActive,
+		Scope:        scope,
+		Weight:       weight,
+		Metadata:     metadata,
+		Credential: &model.Credential{
+			AccessToken: apiKey,
+		},
+	}
+
+	if err = s.store.CreateConnection(r.Context(), conn, conn.Credential); err != nil {
+		return storeError(err, "create connection")
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]any{"connection": conn})
 	return nil
 }
 
@@ -241,10 +397,23 @@ func (s *Server) deleteConnection(w http.ResponseWriter, r *http.Request) *apiEr
 
 // refreshConnection forces a token refresh, which is how a user recovers an
 // account that went into error without signing in again.
+//
+// API-key providers have nothing to refresh — the access token is the API
+// key itself — so the call is a no-op that reloads the row instead of
+// producing a misleading "refresh failed" error.
 func (s *Server) refreshConnection(w http.ResponseWriter, r *http.Request) *apiError {
 	conn, apiErr := s.loadConnection(r, true)
 	if apiErr != nil {
 		return apiErr
+	}
+
+	if !conn.Provider.IsOAuth() {
+		updated, err := s.store.GetConnection(r.Context(), conn.ID)
+		if err != nil {
+			return storeError(err, "reload connection")
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"connection": updated, "note": "API-key providers have no token to refresh"})
+		return nil
 	}
 
 	if _, err := s.registry.Tokens().ForceRefresh(r.Context(), conn); err != nil {
@@ -336,7 +505,10 @@ func (s *Server) startOAuth(w http.ResponseWriter, r *http.Request) *apiError {
 
 	providerID := model.Provider(strings.ToLower(trim(body.Provider)))
 	if !providerID.Valid() {
-		return invalid(map[string]string{"provider": "must be codex or antigravity"})
+		return invalid(map[string]string{"provider": "must be codex, antigravity, or openai"})
+	}
+	if !providerID.IsOAuth() {
+		return invalid(map[string]string{"provider": string(providerID) + " uses an API key; create the connection via POST /api/connections instead of the OAuth flow"})
 	}
 	vendor, err := s.registry.Get(providerID)
 	if err != nil {

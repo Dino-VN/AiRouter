@@ -60,6 +60,9 @@ func NewRouter(st *store.Store, registry *provider.Registry, logger *slog.Logger
 	if vendor, err := registry.Get(model.ProviderAntigravity); err == nil {
 		r.executors[model.ProviderAntigravity] = newAntigravityExecutor(client, registry.Tokens(), vendor, logger)
 	}
+	if vendor, err := registry.Get(model.ProviderOpenAI); err == nil {
+		r.executors[model.ProviderOpenAI] = newOpenAIExecutor(client, registry.Tokens(), vendor, logger)
+	}
 	return r
 }
 

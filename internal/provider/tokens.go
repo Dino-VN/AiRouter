@@ -46,9 +46,20 @@ func newTokenManager(registry *Registry, st *store.Store, logger *slog.Logger) *
 
 // Ensure returns a credential whose access token is currently valid, refreshing
 // and persisting it when needed. conn.Credential is updated in place.
+//
+// For API-key providers (model.ProviderOpenAI and any future provider where
+// IsOAuth() is false) there is nothing to refresh — the access token is the
+// API key itself, which the operator rotates out-of-band — so this method
+// short-circuits and returns the stored credential.
 func (m *TokenManager) Ensure(ctx context.Context, conn *model.Connection) (*model.Credential, error) {
 	if conn == nil {
 		return nil, errors.New("provider: nil connection")
+	}
+	if !conn.Provider.IsOAuth() {
+		if conn.Credential == nil || conn.Credential.AccessToken == "" {
+			return nil, fmt.Errorf("%w: %s connection %s", ErrNoAPIKey, conn.Provider, conn.Label)
+		}
+		return conn.Credential, nil
 	}
 	if conn.Credential != nil && !conn.Credential.Expired(refreshSkew) {
 		return conn.Credential, nil
@@ -57,7 +68,16 @@ func (m *TokenManager) Ensure(ctx context.Context, conn *model.Connection) (*mod
 }
 
 // ForceRefresh renews a credential even if the current token still looks valid.
+//
+// For API-key providers this is a no-op that returns the stored credential;
+// there is no upstream refresh endpoint to call.
 func (m *TokenManager) ForceRefresh(ctx context.Context, conn *model.Connection) (*model.Credential, error) {
+	if conn != nil && !conn.Provider.IsOAuth() {
+		if conn.Credential == nil || conn.Credential.AccessToken == "" {
+			return nil, fmt.Errorf("%w: %s connection %s", ErrNoAPIKey, conn.Provider, conn.Label)
+		}
+		return conn.Credential, nil
+	}
 	return m.refresh(ctx, conn)
 }
 

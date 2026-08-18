@@ -141,8 +141,10 @@ func (p *codexProvider) Refresh(ctx context.Context, cred *model.Credential) (*A
 
 func (p *codexProvider) FetchQuota(_ context.Context, conn *model.Connection) (*model.UpstreamQuota, error) {
 	// ChatGPT reports Codex usage only in the response headers of a real
-	// completion call, so there is nothing to poll. Keep whatever the last
-	// proxied request observed and refresh the plan from the ID token.
+	// completion call, so there is no quota endpoint to poll. Keep whatever
+	// the last proxied request observed (so the UI continues to show rate
+	// limit windows when they exist), and refresh the plan from the ID token
+	// — that part is always up to date.
 	quota := &model.UpstreamQuota{UpdatedAt: time.Now()}
 	if conn.Quota != nil {
 		quota.Windows = conn.Quota.Windows
@@ -154,8 +156,21 @@ func (p *codexProvider) FetchQuota(_ context.Context, conn *model.Connection) (*
 		}
 	}
 	if len(quota.Windows) == 0 {
-		quota.Note = "Codex reports usage windows alongside a completion request; " +
-			"send one request through this connection to populate them."
+		// Make the "no data" state self-explanatory in the UI rather than
+		// looking like a bug. Operators reading this know exactly what to do:
+		// route a single chat completion through this connection, and the
+		// response headers populate the windows on the next refresh.
+		quota.Note = "ChatGPT does not expose a Codex quota endpoint. The " +
+			"x-codex-primary-* and x-codex-secondary-* rate-limit headers " +
+			"are captured on every proxied completion and shown here once " +
+			"this connection has served at least one request."
+	} else {
+		// Explain where the windows came from so the operator can tell a
+		// stale snapshot (e.g. headers from before a plan upgrade) apart
+		// from a fresh one.
+		quota.Note = "Captured from response headers of the last proxied " +
+			"completion. ChatGPT does not expose a Codex quota endpoint, " +
+			"so these windows are only as fresh as the most recent request."
 	}
 	return quota, nil
 }

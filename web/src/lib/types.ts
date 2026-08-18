@@ -2,7 +2,7 @@
 // types can be compared against internal/model directly.
 
 export type Role = "admin" | "user"
-export type ProviderID = "codex" | "antigravity"
+export type ProviderID = "codex" | "antigravity" | "openai"
 export type UserStatus = "active" | "suspended" | "revoked"
 export type ConnectionStatus = "active" | "expired" | "disabled" | "error"
 export type Scope = "private" | "shared"
@@ -226,6 +226,32 @@ export type ProviderInfo = {
   usable: number
   models: number
   auto_callback: boolean
+  /** True when the provider authenticates via an OAuth flow (Codex,
+   *  Antigravity). False for API-key providers (OpenAI-compatible
+   *  endpoint) — the UI uses this flag to decide between the consent
+   *  flow and the API-key form. */
+  oauth: boolean
+}
+
+/** Body of POST /api/connections, used to register an OpenAI-compatible
+ * API-key connection. The server only honours this for providers where
+ * model.Provider.IsOAuth() is false. */
+export type CreateAPIKeyConnectionRequest = {
+  provider: ProviderID
+  label: string
+  api_key: string
+  base_url?: string
+  plan?: string
+  account_email?: string
+  scope?: Scope
+  weight?: number
+  models?: string[]
+  extra_headers?: Record<string, string>
+  quota_note?: string
+}
+
+export type CreateConnectionResponse = {
+  connection: Connection
 }
 
 export type CatalogResponse = {

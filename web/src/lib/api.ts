@@ -14,6 +14,8 @@ import type {
   Connection,
   ConnectionDetail,
   ConnectionsResponse,
+  CreateAPIKeyConnectionRequest,
+  CreateConnectionResponse,
   CreateKeyResponse,
   CreateUserResponse,
   KeysResponse,
@@ -307,6 +309,12 @@ export const api = {
       post<{ quota: UpstreamQuota | null; note?: string }>(
         `/api/connections/${id}/quota`
       ),
+    /** Create an API-key based connection (ProviderOpenAI today; any future
+     *  provider where IsOAuth() returns false lands here too). OAuth-backed
+     *  providers reject this endpoint and direct the caller to /api/oauth/sessions
+     *  instead, so the UI always knows which entry point to use per provider. */
+    create: (body: CreateAPIKeyConnectionRequest) =>
+      post<CreateConnectionResponse>("/api/connections", body),
   },
 
   oauth: {

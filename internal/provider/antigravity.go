@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -171,10 +172,28 @@ func (p *antigravityProvider) Refresh(ctx context.Context, cred *model.Credentia
 }
 
 func (p *antigravityProvider) FetchQuota(ctx context.Context, conn *model.Connection) (*model.UpstreamQuota, error) {
-	if conn.Credential == nil || conn.Credential.AccessToken == "" {
-		return nil, fmt.Errorf("antigravity: connection has no access token")
+	if conn == nil {
+		return nil, fmt.Errorf("antigravity: nil connection")
 	}
+	if conn.Credential == nil || conn.Credential.AccessToken == "" {
+		return nil, fmt.Errorf("antigravity: connection %s has no access token; sign the account in again",
+			conn.Label)
+	}
+
+	// The first call may hit a token that has been revoked or rotated since
+	// the last refresh. A 401 from loadCodeAssist means the access token is
+	// no good; refresh it once and retry so an operator's "refresh quota"
+	// click succeeds even on a connection that has sat idle past its token
+	// lifetime.
 	info, err := p.loadCodeAssist(ctx, conn.Credential.AccessToken)
+	if err != nil && errors.Is(err, ErrCredentialRevoked) && conn.Credential.RefreshToken != "" {
+		refreshed, refreshErr := p.Refresh(ctx, conn.Credential)
+		if refreshErr != nil {
+			return nil, fmt.Errorf("antigravity: quota fetch failed (%w) and refresh also failed: %v", err, refreshErr)
+		}
+		conn.Credential = refreshed.Credential
+		info, err = p.loadCodeAssist(ctx, refreshed.Credential.AccessToken)
+	}
 	if err != nil {
 		return nil, err
 	}

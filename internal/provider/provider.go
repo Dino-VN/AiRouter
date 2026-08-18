@@ -96,6 +96,7 @@ func NewRegistry(cfg *config.Config, st *store.Store, logger *slog.Logger) (*Reg
 	}
 	r.providers[model.ProviderCodex] = newCodex(authClient, logger)
 	r.providers[model.ProviderAntigravity] = newAntigravity(authClient, logger)
+	r.providers[model.ProviderOpenAI] = newOpenAIProvider(authClient, logger)
 	r.tokens = newTokenManager(r, st, logger)
 	return r, nil
 }

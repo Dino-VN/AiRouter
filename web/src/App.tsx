@@ -6,7 +6,7 @@ import { Booting } from "@/components/page"
 import { useAuth } from "@/context/auth"
 import AdminOverviewPage from "@/pages/admin-overview"
 import ApiKeysPage from "@/pages/api-keys"
-import ConnectionsPage from "@/pages/connections"
+import ProvidersPage from "@/pages/providers"
 import DashboardPage from "@/pages/dashboard"
 import LoginPage from "@/pages/login"
 import NotFoundPage from "@/pages/not-found"
@@ -68,7 +68,9 @@ export function App() {
         }
       >
         <Route path="/" element={<DashboardPage />} />
-        <Route path="/connections" element={<ConnectionsPage />} />
+        <Route path="/providers" element={<ProvidersPage />} />
+        <Route path="/providers/:provider" element={<ProvidersPage />} />
+        <Route path="/connections" element={<ProvidersPage />} />
         <Route path="/keys" element={<ApiKeysPage />} />
         <Route path="/usage" element={<UsagePage />} />
         <Route path="/quota" element={<QuotaPage />} />

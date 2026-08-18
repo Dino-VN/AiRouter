@@ -4,6 +4,7 @@ import {
   CircleCheckIcon,
   ExternalLinkIcon,
   GaugeIcon,
+  KeyRoundIcon,
   PlugZapIcon,
   RefreshCwIcon,
   SettingsIcon,
@@ -64,12 +65,36 @@ type Wizard = {
   autoCallback: boolean
 }
 
-export default function ConnectionsPage() {
+type APIKeyDraft = {
+  provider: ProviderInfo
+  label: string
+  apiKey: string
+  baseURL: string
+  plan: string
+  accountEmail: string
+  models: string // newline-delimited
+  extraHeaders: string // newline-delimited "Key: Value"
+  quotaNote: string
+}
+
+const EMPTY_API_KEY_DRAFT: Omit<APIKeyDraft, "provider"> = {
+  label: "",
+  apiKey: "",
+  baseURL: "https://api.openai.com/v1",
+  plan: "",
+  accountEmail: "",
+  models: "",
+  extraHeaders: "",
+  quotaNote: "",
+}
+
+export default function ProvidersPage() {
   const { isAdmin } = useAuth()
   const [showAll, setShowAll] = React.useState(false)
   const [startFor, setStartFor] = React.useState<ProviderInfo | null>(null)
   const [wizard, setWizard] = React.useState<Wizard | null>(null)
   const [editing, setEditing] = React.useState<Connection | null>(null)
+  const [addAPIKeyFor, setAddAPIKeyFor] = React.useState<ProviderInfo | null>(null)
   const [confirmRequest, setConfirmRequest] = React.useState<ConfirmRequest | null>(
     null
   )
@@ -119,8 +144,8 @@ export default function ConnectionsPage() {
   return (
     <div className="grid gap-5">
       <PageHeader
-        title="Connections"
-        description="Upstream accounts this server can route through, and the temporary sign-ins that are still in progress."
+        title="Providers"
+        description="Upstream providers this server can route through. Each provider manages its own accounts and models."
       >
         {isAdmin ? (
           <Label className="mr-1 text-xs text-muted-foreground">
@@ -152,7 +177,7 @@ export default function ConnectionsPage() {
 
       <div className="grid gap-3 sm:grid-cols-2">
         {providers.length === 0 && view.loading
-          ? [0, 1].map((key) => <Skeleton key={key} className="h-28 w-full" />)
+          ? [0, 1, 2].map((key) => <Skeleton key={key} className="h-28 w-full" />)
           : providers.map((provider) => (
               <Card key={provider.id}>
                 <CardHeader>
@@ -167,29 +192,51 @@ export default function ConnectionsPage() {
                     {provider.models} models
                   </CardDescription>
                   <CardAction>
-                    <Button
-                      type="button"
-                      size="sm"
-                      disabled={!provider.allowed}
-                      onClick={() => setStartFor(provider)}
-                    >
-                      <PlugZapIcon />
-                      Connect
-                    </Button>
+                    {provider.oauth ? (
+                      <Button
+                        type="button"
+                        size="sm"
+                        disabled={!provider.allowed}
+                        onClick={() => setStartFor(provider)}
+                      >
+                        <PlugZapIcon />
+                        Connect
+                      </Button>
+                    ) : (
+                      <Button
+                        type="button"
+                        size="sm"
+                        disabled={!provider.allowed}
+                        onClick={() => setAddAPIKeyFor(provider)}
+                      >
+                        <KeyRoundIcon />
+                        Add API key
+                      </Button>
+                    )}
                   </CardAction>
                 </CardHeader>
                 <CardContent className="grid gap-1 text-xs text-muted-foreground">
-                  <span>
-                    Callback{" "}
-                    <code className="rounded bg-muted px-1 py-0.5 font-mono">
-                      {provider.redirect_uri || provider.callback_path}
-                    </code>
-                  </span>
-                  <span>
-                    {provider.auto_callback
-                      ? "This server is listening on the callback port, so the browser finishes the sign-in for you."
-                      : "The callback port is not bound; paste the redirect URL back here to finish."}
-                  </span>
+                  {provider.oauth ? (
+                    <>
+                      <span>
+                        Callback{" "}
+                        <code className="rounded bg-muted px-1 py-0.5 font-mono">
+                          {provider.redirect_uri || provider.callback_path}
+                        </code>
+                      </span>
+                      <span>
+                        {provider.auto_callback
+                          ? "This server is listening on the callback port, so the browser finishes the sign-in for you."
+                          : "The callback port is not bound; paste the redirect URL back here to finish."}
+                      </span>
+                    </>
+                  ) : (
+                    <span>
+                      Forward <code className="rounded bg-muted px-1 py-0.5 font-mono">/v1/chat/completions</code> and{" "}
+                      <code className="rounded bg-muted px-1 py-0.5 font-mono">/v1/responses</code> to any
+                      OpenAI-compatible endpoint using an API key.
+                    </span>
+                  )}
                 </CardContent>
               </Card>
             ))}
@@ -333,7 +380,7 @@ export default function ConnectionsPage() {
             <Empty
               icon={<PlugZapIcon />}
               title="No accounts connected"
-              description="Connect a Codex or Antigravity account to start serving requests."
+              description="Connect a Codex or Antigravity account, or add an OpenAI API key."
             />
           </CardContent>
         </Card>
@@ -388,6 +435,19 @@ export default function ConnectionsPage() {
             instructions: result.instructions,
             autoCallback: result.auto_callback,
           })
+          reload()
+        }}
+      />
+
+      <AddAPIKeyDialog
+        provider={addAPIKeyFor}
+        canShare={isAdmin}
+        onClose={() => setAddAPIKeyFor(null)}
+        onSaved={(conn) => {
+          setAddAPIKeyFor(null)
+          setNotice(
+            `${providerLabel(conn.provider)} connection added as ${conn.label}.`
+          )
           reload()
         }}
       />
@@ -555,6 +615,218 @@ function ConnectionCard({
 // ---------------------------------------------------------------------------
 // Dialogs
 // ---------------------------------------------------------------------------
+
+function AddAPIKeyDialog({
+  provider,
+  canShare,
+  onClose,
+  onSaved,
+}: {
+  provider: ProviderInfo | null
+  canShare: boolean
+  onClose: () => void
+  onSaved: (conn: Connection) => void
+}) {
+  const [draft, setDraft] = React.useState<APIKeyDraft>(() => ({
+    ...EMPTY_API_KEY_DRAFT,
+    provider: provider!,
+  }))
+  const [scope, setScope] = React.useState<Scope>("private")
+  const [weight, setWeight] = React.useState(1)
+  const [error, setError] = React.useState<string | null>(null)
+  const [pending, setPending] = React.useState(false)
+
+  React.useEffect(() => {
+    if (provider) {
+      setDraft({ ...EMPTY_API_KEY_DRAFT, provider })
+      setScope("private")
+      setWeight(1)
+      setError(null)
+      setPending(false)
+    }
+  }, [provider])
+
+  if (!provider) {
+    return null
+  }
+
+  const update = (patch: Partial<APIKeyDraft>) =>
+    setDraft((current) => ({ ...current, ...patch }))
+
+  const submit = () => {
+    const apiKey = draft.apiKey.trim()
+    const label = draft.label.trim()
+    if (!apiKey) {
+      setError("API key is required.")
+      return
+    }
+    if (!label) {
+      setError("Label is required.")
+      return
+    }
+    // Parse newline-delimited "Key: Value" lines into a header map. Empty
+    // lines and lines without a colon are dropped with a warning.
+    const extraHeaders: Record<string, string> = {}
+    for (const line of draft.extraHeaders.split("\\n")) {
+      const trimmed = line.trim()
+      if (!trimmed) continue
+      const [key, ...rest] = trimmed.split(":")
+      if (!key || rest.length === 0) {
+        setError(`Could not parse header line: ${trimmed}`)
+        return
+      }
+      extraHeaders[key.trim()] = rest.join(":").trim()
+    }
+    const models = draft.models
+      .split("\\n")
+      .map((m) => m.trim())
+      .filter(Boolean)
+
+    setPending(true)
+    setError(null)
+    api.connections
+      .create({
+        provider: provider.id as "openai",
+        label,
+        api_key: apiKey,
+        base_url: draft.baseURL.trim() || undefined,
+        plan: draft.plan.trim() || undefined,
+        account_email: draft.accountEmail.trim() || undefined,
+        scope,
+        weight,
+        models: models.length > 0 ? models : undefined,
+        extra_headers: Object.keys(extraHeaders).length > 0 ? extraHeaders : undefined,
+        quota_note: draft.quotaNote.trim() || undefined,
+      })
+      .then((response) => {
+        setPending(false)
+        onSaved(response.connection)
+      })
+      .catch((err: unknown) => {
+        setPending(false)
+        setError(errorMessage(err))
+      })
+  }
+
+  return (
+    <Dialog
+      open={provider !== null}
+      onClose={onClose}
+      title={`Add ${provider.display_name} API key`}
+      description="Register an OpenAI-compatible endpoint with an API key. Works against api.openai.com, Azure OpenAI, OpenRouter, vLLM, LocalAI, etc."
+      footer={
+        <>
+          <Button type="button" variant="ghost" onClick={onClose} disabled={pending}>
+            Cancel
+          </Button>
+          <Button type="button" onClick={submit} disabled={pending}>
+            <KeyRoundIcon />
+            Save connection
+          </Button>
+        </>
+      }
+    >
+      <ErrorAlert error={error} />
+      <div className="grid gap-3">
+        <Field label="Label" hint="A name for this connection." htmlFor="label">
+          <Input
+            id="label"
+            value={draft.label}
+            placeholder="My OpenAI key"
+            onChange={(e) => update({ label: e.target.value })}
+          />
+        </Field>
+        <Field label="API key" hint="The bearer token sent as Authorization." htmlFor="apiKey">
+          <Input
+            id="apiKey"
+            type="password"
+            value={draft.apiKey}
+            placeholder="sk-..."
+            onChange={(e) => update({ apiKey: e.target.value })}
+          />
+        </Field>
+        <Field
+          label="Base URL"
+          hint="Defaults to https://api.openai.com/v1. Override for Azure, OpenRouter, vLLM, etc."
+          htmlFor="baseURL"
+        >
+          <Input
+            id="baseURL"
+            value={draft.baseURL}
+            placeholder="https://api.openai.com/v1"
+            onChange={(e) => update({ baseURL: e.target.value })}
+          />
+        </Field>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="Plan (optional)" htmlFor="plan">
+            <Input
+              id="plan"
+              value={draft.plan}
+              placeholder="paygo, scale, ..."
+              onChange={(e) => update({ plan: e.target.value })}
+            />
+          </Field>
+          <Field label="Account email (optional)" htmlFor="accountEmail">
+            <Input
+              id="accountEmail"
+              value={draft.accountEmail}
+              onChange={(e) => update({ accountEmail: e.target.value })}
+            />
+          </Field>
+        </div>
+        {canShare ? (
+          <Field label="Scope" htmlFor="scope">
+            <Select
+              id="scope"
+              value={scope}
+              onChange={(e) => setScope(e.target.value as Scope)}
+            >
+              <option value="private">Private to me</option>
+              <option value="shared">Shared pool</option>
+            </Select>
+          </Field>
+        ) : null}
+        <Field
+          label="Models (optional)"
+          hint="One per line. When set, only these models are advertised for this connection."
+          htmlFor="models"
+        >
+          <Textarea
+            id="models"
+            rows={3}
+            value={draft.models}
+            placeholder={"gpt-4o\\ngpt-4o-mini"}
+            onChange={(e) => update({ models: e.target.value })}
+          />
+        </Field>
+        <Field
+          label="Extra headers (optional)"
+          hint='One per line as "Header: Value". Useful for OpenAI-Beta, Helicone-Auth, etc.'
+          htmlFor="extraHeaders"
+        >
+          <Textarea
+            id="extraHeaders"
+            rows={3}
+            value={draft.extraHeaders}
+            placeholder={'OpenAI-Beta: assistants=v2'}
+            onChange={(e) => update({ extraHeaders: e.target.value })}
+          />
+        </Field>
+        <Field
+          label="Quota note (optional)"
+          hint="Overrides the default message shown when no usage windows are populated yet."
+          htmlFor="quotaNote"
+        >
+          <Input
+            id="quotaNote"
+            value={draft.quotaNote}
+            onChange={(e) => update({ quotaNote: e.target.value })}
+          />
+        </Field>
+      </div>
+    </Dialog>
+  )
+}
 
 function StartDialog({
   provider,
