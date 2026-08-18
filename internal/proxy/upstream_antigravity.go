@@ -122,12 +122,15 @@ func (e *antigravityExecutor) send(ctx context.Context, conn *model.Connection, 
 	if agent, ok := e.vendor.(userAgentProvider); ok {
 		httpReq.Header.Set("User-Agent", agent.UserAgent(ctx))
 	}
-	// The Cloud Code backend gates tier access on the X-Goog-Api-Client
-	// header matching what the IDE's Node-API client sends. Missing it on a
-	// request whose User-Agent otherwise looks like the IDE is one of the
-	// signals that triggers "Resource has been exhausted" even on accounts
-	// that still have GOOGLE_ONE_AI credits (OmniRoute #8098).
-	httpReq.Header.Set("X-Goog-Api-Client", "gl-node/22.21.1")
+	// X-Goog-Api-Client is NOT set on content requests. OmniRoute's
+	// applyAntigravityClientProfileHeaders removes this header for both
+	// the IDE and CLI profiles (see ABSENT_CONTENT_IDENTITY_HEADERS in
+	// open-sse/services/antigravityClientProfile.ts); sending it with a
+	// CLI User-Agent confuses the backend's identity gate and is one of
+	// the things that triggered "Resource has been exhausted" 429s on
+	// free-tier accounts. The header is only sent on the onboarding
+	// endpoint (loadCodeAssist + onboardUser), which uses the IDE
+	// Node-API client profile — see antigravity.go callAPI().
 	// x-goog-user-project routes the request to the right Cloud Code
 	// project; without it the backend falls back to the access token's
 	// own project, which on a freshly-onboarded account may not have a
@@ -217,7 +220,6 @@ func (e *antigravityExecutor) send(ctx context.Context, conn *model.Connection, 
 			if agent, ok := e.vendor.(userAgentProvider); ok {
 				retryReq.Header.Set("User-Agent", agent.UserAgent(ctx))
 			}
-			retryReq.Header.Set("X-Goog-Api-Client", "gl-node/22.21.1")
 			if conn.ProjectID != "" {
 				retryReq.Header.Set("X-Goog-User-Project", conn.ProjectID)
 			}
@@ -275,7 +277,6 @@ func (e *antigravityExecutor) send(ctx context.Context, conn *model.Connection, 
 				if agent, ok := e.vendor.(userAgentProvider); ok {
 					retryReq.Header.Set("User-Agent", agent.UserAgent(ctx))
 				}
-				retryReq.Header.Set("X-Goog-Api-Client", "gl-node/22.21.1")
 				// OmniRoute's sendAntigravityRequest removes
 				// x-goog-user-project on a 403 retry (see
 				// open-sse/executors/antigravity/executeAttempt.ts:366).

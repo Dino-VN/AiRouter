@@ -753,23 +753,41 @@ func (p *antigravityProvider) callAPI(ctx context.Context, endpoint, accessToken
 	return body, nil
 }
 
-// userAgent returns the User-Agent the Antigravity IDE sends on content
-// requests. The upstream backend inspects this header to gate access to the
-// paid tiers, so the value must match what the official IDE emits — including
-// the platform token, which OmniRoute (#8098) has shown is pinned to
-// darwin/arm64 regardless of the host this binary happens to run on.
+// userAgent returns the User-Agent the Antigravity CLI (`agy`) sends on
+// content requests. The upstream backend inspects this header to gate
+// access to the paid tiers, so the value must match what the official
+// client emits — including the platform token, which OmniRoute (#8098)
+// has shown is pinned to darwin/arm64 regardless of the host this
+// binary happens to run on.
 //
-// OmniRoute distinguishes an IDE profile (`antigravity/ide/<version>
-// darwin/arm64`) from a CLI profile (`antigravity/cli/<version>
-// (aidev_client; os_type=darwin; arch=arm64; auth_method=consumer)`).
-// This binary only ever sends the IDE profile, matching the desktop app
-// the operator signed in with.
+// OmniRoute distinguishes two profiles in open-sse/services/antigravityHeaders.ts:
+//
+//   - IDE: `antigravity/ide/<version> darwin/arm64`
+//   - CLI: `antigravity/cli/<version> (aidev_client; os_type=darwin; arch=arm64; auth_method=consumer)`
+//
+// We send the CLI profile here because the IDE profile kept
+// returning 429 "Resource has been exhausted (e.g. check quota)" on
+// free-tier accounts even with X-Goog-Api-Client and X-Goog-User-Project
+// set. The CLI profile uses a different client identifier
+// (aidev_client) and a different auth_method (consumer) — Google
+// routes it through the agy CLI's quota bucket instead of the
+// desktop IDE's, which on the operator's accounts is what actually
+// unblocks the request.
+//
+// The credentials (client_id / client_secret) are the SAME for both
+// profiles — see the comment on AGY_CONFIG in
+// src/lib/oauth/constants/oauth.ts: "the client_id was verified
+// byte-for-byte identical". Only the User-Agent and X-Goog-Api-Client
+// header differ; the OAuth flow and Cloud Code endpoints are shared.
 func (p *antigravityProvider) userAgent(ctx context.Context, long bool) string {
 	version := p.ideVersion(ctx)
-	ua := fmt.Sprintf("antigravity/ide/%s darwin/arm64", version)
+	ua := fmt.Sprintf("antigravity/cli/%s (aidev_client; os_type=darwin; arch=arm64; auth_method=consumer)", version)
 	if long {
-		// The onboarding endpoint expects the IDE's Node-API client suffix.
-		ua += " " + antigravityNodeAPIClient
+		// The onboarding endpoint expects the IDE's Node-API client
+		// suffix. Keep that here even though content requests use the
+		// CLI profile — onboardUser is the IDE's bootstrap path and
+		// rejecting a CLI-style UA on it would break provisioning.
+		ua = fmt.Sprintf("antigravity/ide/%s darwin/arm64 %s", version, antigravityNodeAPIClient)
 	}
 	return ua
 }
@@ -779,12 +797,17 @@ func (p *antigravityProvider) UserAgent(ctx context.Context) string {
 	return p.userAgent(ctx, false)
 }
 
-// ContentHeaderXGoogApiClient is the value Antigravity's IDE attaches to
-// the X-Goog-Api-Client header on content requests. The backend uses this
-// together with the User-Agent to identify the calling client; missing it
-// on a request whose User-Agent looks like the IDE is one of the signals
-// that triggers the "Resource has been exhausted" rejection (#resource
-// exhausted) even on accounts that still have GOOGLE_ONE_AI credits.
+// ContentHeaderXGoogApiClient is the value Antigravity's IDE Node-API
+// client attaches to the X-Goog-Api-Client header. OmniRoute's
+// applyAntigravityClientProfileHeaders removes this header from
+// content requests for both the IDE and CLI profiles (see
+// ABSENT_CONTENT_IDENTITY_HEADERS in
+// open-sse/services/antigravityClientProfile.ts), so the constant is
+// kept here only for the onboarding endpoint, which uses the
+// getAntigravityIdeNodeHeaders shape. Content requests must NOT set
+// this header — sending it with a CLI User-Agent confuses the
+// backend's identity gate and is one of the things that triggers the
+// "Resource has been exhausted" 429 on free-tier accounts.
 const antigravityContentXGoogApiClient = "gl-node/22.21.1"
 
 // ideVersion returns the current Antigravity version, cached for an hour. The
