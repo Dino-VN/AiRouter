@@ -14,9 +14,16 @@ package provider
 // keep pattern scanners quiet; the plaintext values are identical to
 // the ones that ship in the upstream binaries.
 //
+// GitHub's secret scanner still flags Google OAuth client secrets
+// (the GOCSPX-… prefix) even when they ship publicly in upstream
+// binaries. The operator accepts the scanner alert per push rather
+// than masking the values: the plaintext is the single source of
+// truth, and the unblock link the scanner prints is shared across
+// every future push so the cost is one click per release.
+//
 // Today only Antigravity and Codex are wired into aihub's OAuth flow.
-// The rest are recorded here as a single source of truth so that when
-// a new provider is added, the credentials do not have to be
+// The rest are recorded here as exported helpers so that when a new
+// provider is added, the credentials do not have to be
 // reverse-engineered again — and so that operators who want to
 // override any of them (e.g. to point Antigravity at an internal
 // mirror) have a single env var to set per provider.
