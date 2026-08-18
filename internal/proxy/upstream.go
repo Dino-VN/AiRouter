@@ -21,6 +21,13 @@ type sendOptions struct {
 	// so the executor should forward the client body (sanitised) instead of
 	// re-rendering it from the canonical request.
 	Raw bool
+
+	// RetryedProjectRoute is set when the executor has already retried the
+	// upstream call once after a project-route 403 (Antigravity's "Cloud
+	// Code Private API has not been used in project …"). The retry path
+	// sets it to true before issuing the second attempt so the executor's
+	// error classifier does not loop forever on the same shape.
+	RetryedProjectRoute bool
 }
 
 // executor talks to one provider. It owns the request shape, the response

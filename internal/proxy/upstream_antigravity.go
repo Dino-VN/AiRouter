@@ -141,8 +141,70 @@ func (e *antigravityExecutor) send(ctx context.Context, conn *model.Connection, 
 		return nil, asAPIError(model.ProviderAntigravity, err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		defer resp.Body.Close()
-		return nil, apiErrorFromResponse(model.ProviderAntigravity, resp.StatusCode, resp.Header, readErrorBody(resp.Body))
+		body := readErrorBody(resp.Body)
+		resp.Body.Close()
+
+		// Cloud Code 403 with "has not been used in project …"
+		// means the project id we just sent is stale: Google
+		// disabled the API on it, deleted it, or the IDE
+		// re-onboarded the account to a different project
+		// since we last looked. Force a fresh onboard via
+		// EnsureProjectID (which calls loadCodeAssist again
+		// and, when that returns nothing, provisions a new
+		// project through onboardUser), then retry the
+		// request once with the new project id. A second 403
+		// with the same shape is allowed to surface — we do
+		// not loop.
+		if resp.StatusCode == http.StatusForbidden &&
+			antigravityProjectRouteError(body) && !opts.RetryedProjectRoute {
+			if ensurer, ok := e.vendor.(antigravityProjectEnsurer); ok {
+				e.log.Info("antigravity: 403 project-route error; refreshing project id and retrying once",
+					"connection", conn.ID, "project", conn.ProjectID)
+				if ensureErr := ensurer.EnsureProjectID(ctx, conn); ensureErr != nil {
+					e.log.Debug("antigravity: project id refresh on 403 failed",
+						"connection", conn.ID, "error", ensureErr)
+				}
+				// Rebuild the envelope with the (possibly) new project id.
+				body2, bodyErr := wrapAntigravityRequest(req.Model, conn.ProjectID, inner, opts.Raw)
+				if bodyErr != nil {
+					return nil, asAPIError(model.ProviderAntigravity, bodyErr)
+				}
+				retryReq, retryErr := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body2))
+				if retryErr != nil {
+					return nil, asAPIError(model.ProviderAntigravity, retryErr)
+				}
+				retryReq.Header.Set("Content-Type", "application/json")
+				retryReq.Header.Set("Authorization", "Bearer "+cred.AccessToken)
+				if agent, ok := e.vendor.(userAgentProvider); ok {
+					retryReq.Header.Set("User-Agent", agent.UserAgent(ctx))
+				}
+				retryReq.Header.Set("X-Goog-Api-Client", "gl-node/22.21.1")
+				if conn.ProjectID != "" {
+					retryReq.Header.Set("X-Goog-User-Project", conn.ProjectID)
+				}
+				if req.Stream {
+					retryReq.Header.Set("Accept", "text/event-stream")
+				} else {
+					retryReq.Header.Set("Accept", "application/json")
+				}
+
+				retryResp, retryErr := e.client.Do(retryReq)
+				if retryErr != nil {
+					return nil, asAPIError(model.ProviderAntigravity, retryErr)
+				}
+				if retryResp.StatusCode < 200 || retryResp.StatusCode > 299 {
+					defer retryResp.Body.Close()
+					return nil, apiErrorFromResponse(model.ProviderAntigravity,
+						retryResp.StatusCode, retryResp.Header, readErrorBody(retryResp.Body))
+				}
+				// Replace the original response with the retry's so the
+				// rest of send() consumes it as if the 403 never happened.
+				resp = retryResp
+				opts.RetryedProjectRoute = true
+			}
+		} else {
+			return nil, apiErrorFromResponse(model.ProviderAntigravity, resp.StatusCode, resp.Header, body)
+		}
 	}
 
 	stream := &upstreamStream{Header: resp.Header, Body: resp.Body}
@@ -385,4 +447,25 @@ func geminiSniffUsage(frame sseEvent) *Usage {
 		CachedTokens:     chunk.UsageMetadata.CachedContentTokenCount,
 		TotalTokens:      chunk.UsageMetadata.TotalTokenCount,
 	}
+}
+
+// antigravityProjectRouteError reports whether body is the Cloud Code
+// "Cloud Code Private API has not been used in project …" 403 (or one
+// of its siblings). These errors all mean the project id on the
+// request is no longer usable upstream and the executor should
+// re-resolve it through loadCodeAssist + onboardUser before retrying.
+//
+// The shape mirrors OmniRoute's recoverableProject403 classifier
+// (open-sse/services/errorClassifier.ts:348), which itself was tuned
+// against the Cloud Code backend's error wording over many releases.
+func antigravityProjectRouteError(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	text := strings.ToLower(string(body))
+	return strings.Contains(text, "has not been used in project") ||
+		strings.Contains(text, "service_disabled") ||
+		strings.Contains(text, "accessnotconfiguredured") ||
+		strings.Contains(text, "permission_denied") ||
+		strings.Contains(text, "it is disabled")
 }
