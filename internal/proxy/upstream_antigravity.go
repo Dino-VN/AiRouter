@@ -88,6 +88,19 @@ func (e *antigravityExecutor) send(ctx context.Context, conn *model.Connection, 
 	if agent, ok := e.vendor.(userAgentProvider); ok {
 		httpReq.Header.Set("User-Agent", agent.UserAgent(ctx))
 	}
+	// The Cloud Code backend gates tier access on the X-Goog-Api-Client
+	// header matching what the IDE's Node-API client sends. Missing it on a
+	// request whose User-Agent otherwise looks like the IDE is one of the
+	// signals that triggers "Resource has been exhausted" even on accounts
+	// that still have GOOGLE_ONE_AI credits (OmniRoute #8098).
+	httpReq.Header.Set("X-Goog-Api-Client", "gl-node/22.21.1")
+	// x-goog-user-project routes the request to the right Cloud Code
+	// project; without it the backend falls back to the access token's
+	// own project, which on a freshly-onboarded account may not have a
+	// paid tier attached yet.
+	if conn.ProjectID != "" {
+		httpReq.Header.Set("X-Goog-User-Project", conn.ProjectID)
+	}
 	if req.Stream {
 		httpReq.Header.Set("Accept", "text/event-stream")
 	} else {
@@ -202,6 +215,16 @@ func wrapAntigravityRequest(modelID, projectID string, inner []byte, raw bool) (
 		"requestType": antigravityRequestType,
 		"requestId":   "agent-" + uuid.NewString(),
 		"request":     request,
+		// The Cloud Code backend gates tier access on this field. Without
+		// it the request is billed against the free tier — which on a
+		// paid account that still has GOOGLE_ONE_AI credits surfaces as
+		// "Resource has been exhausted (e.g. check quota)" on the very
+		// first request, even though the operator's account is fine.
+		// OmniRoute (open-sse/services/usage/antigravity.ts) and
+		// CLIProxyAPI both inject this explicitly; we mirror the same
+		// field here so the upstream applies the paid tier the operator
+		// paid for.
+		"enabledCreditTypes": []string{"GOOGLE_ONE_AI"},
 	}
 	if projectID != "" {
 		envelope["project"] = projectID

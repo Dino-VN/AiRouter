@@ -628,11 +628,23 @@ func (p *antigravityProvider) callAPI(ctx context.Context, endpoint, accessToken
 	return body, nil
 }
 
-// AntigravityUserAgent returns the User-Agent the Antigravity IDE sends.
+// userAgent returns the User-Agent the Antigravity IDE sends on content
+// requests. The upstream backend inspects this header to gate access to the
+// paid tiers, so the value must match what the official IDE emits — including
+// the platform token, which OmniRoute (#8098) has shown is pinned to
+// darwin/arm64 regardless of the host this binary happens to run on.
+//
+// OmniRoute distinguishes an IDE profile (`antigravity/ide/<version>
+// darwin/arm64`) from a CLI profile (`antigravity/cli/<version>
+// (aidev_client; os_type=darwin; arch=arm64; auth_method=consumer)`).
+// This binary only ever sends the IDE profile, matching the desktop app
+// the operator signed in with.
 func (p *antigravityProvider) userAgent(ctx context.Context, long bool) string {
-	ua := fmt.Sprintf("antigravity/hub/%s darwin/arm64", p.ideVersion(ctx))
+	version := p.ideVersion(ctx)
+	ua := fmt.Sprintf("antigravity/ide/%s darwin/arm64", version)
 	if long {
-		ua += " google-api-nodejs-client/10.3.0"
+		// The onboarding endpoint expects the IDE's Node-API client suffix.
+		ua += " " + antigravityNodeAPIClient
 	}
 	return ua
 }
@@ -641,6 +653,14 @@ func (p *antigravityProvider) userAgent(ctx context.Context, long bool) string {
 func (p *antigravityProvider) UserAgent(ctx context.Context) string {
 	return p.userAgent(ctx, false)
 }
+
+// ContentHeaderXGoogApiClient is the value Antigravity's IDE attaches to
+// the X-Goog-Api-Client header on content requests. The backend uses this
+// together with the User-Agent to identify the calling client; missing it
+// on a request whose User-Agent looks like the IDE is one of the signals
+// that triggers the "Resource has been exhausted" rejection (#resource
+// exhausted) even on accounts that still have GOOGLE_ONE_AI credits.
+const antigravityContentXGoogApiClient = "gl-node/22.21.1"
 
 // ideVersion returns the current Antigravity version, cached for an hour. The
 // upstream API only uses it for telemetry, so a stale value is harmless.
