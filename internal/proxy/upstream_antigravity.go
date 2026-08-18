@@ -159,42 +159,79 @@ func (e *antigravityExecutor) send(ctx context.Context, conn *model.Connection, 
 	if err != nil {
 		return nil, asAPIError(model.ProviderAntigravity, err)
 	}
-	if e.debug {
-		e.logDebug("antigravity upstream response status",
-			"connection", conn.ID,
-			"status", resp.StatusCode,
-			"content_type", resp.Header.Get("Content-Type"),
-		)
-	}
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+
+	// Retry loop. OmniRoute's sendAntigravityRequest (open-sse/
+	// executors/antigravity/executeAttempt.ts) handles two retry-able
+	// shapes on this endpoint: 403 project-route errors (the proxy
+	// drops X-Goog-User-Project and retries) and 429 transient RPM/TPM
+	// rate limits (the proxy waits a short backoff and retries the
+	// same connection). A request can hit both shapes in sequence —
+	// the 403 retry can return 429, or vice versa — so the two retry
+	// strategies must chain rather than be mutually-exclusive. The
+	// loop below allows up to maxAntigravityRetries attempts and
+	// tracks which strategies have already been used so we do not
+	// loop forever on the same shape.
+	const maxAntigravityRetries = 3
+	var retriedProjectRoute, retriedTransient429 bool
+	for attempt := 0; attempt < maxAntigravityRetries; attempt++ {
+		if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
+			break
+		}
+
 		body := readErrorBody(resp.Body)
 		resp.Body.Close()
 		if e.debug {
 			e.logDebug("antigravity upstream error body",
 				"connection", conn.ID,
+				"attempt", attempt,
 				"status", resp.StatusCode,
 				"error_body", truncateForLog(string(body), 16*1024),
 			)
 		}
 
-		// Cloud Code 429 with "Resource has been exhausted (e.g. check
-		// quota)" is a transient RPM/TPM rate limit, NOT a depleted
-		// quota. OmniRoute's accountFallback.ts:203-204 calls this out
-		// explicitly: the generic "has been exhausted" phrasing must
-		// stay RATE_LIMIT_EXCEEDED because it appears in Gemini's
-		// per-minute 429 body. Real quota-exhaustion wording uses
-		// "tier has been exhausted", "exceeded your current usage
-		// quota", "credit_balance_too_low", "insufficient credits",
-		// etc. (see CREDITS_EXHAUSTED_SIGNALS).
-		//
-		// Treat the transient flavour as such: wait a short backoff
-		// (2-4 s) and retry the same connection once. If the second
-		// attempt also 429s with the same shape, surface the error
-		// with a short cooldown (10 s instead of the router's default
-		// 60 s) so the next proxied request has a chance to land in
-		// the next per-minute bucket.
-		if resp.StatusCode == http.StatusTooManyRequests &&
-			antigravityTransientRateLimit(body) && !opts.RetryedProjectRoute {
+		// Decide whether to retry. The order matters: the 403
+		// project-route retry refreshes the project id and drops
+		// X-Goog-User-Project, the 429 transient retry sleeps 3 s
+		// and resends with the same project id. Both strategies are
+		// mutually-exclusive on the same attempt but can run in
+		// sequence across attempts (a 403 retry that comes back
+		// 429 will hit the 429 branch on the next iteration).
+		var retryReq *http.Request
+		var retryReason string
+		switch {
+		case resp.StatusCode == http.StatusForbidden &&
+			antigravityGeoBlocked(body):
+			// Geo-blocked is terminal — retrying the same
+			// connection cannot help, and cooling it down
+			// for a day stops the router from re-selecting
+			// it on every request. Surface a clear "set
+			// AIHUB_PROXY_URL" message so the operator knows
+			// the actual fix.
+			return nil, &APIError{
+				Status: http.StatusForbidden,
+				Type:   "geo_blocked",
+				Code:   "unsupported_location",
+				Message: "antigravity: Google Code Assist rejected this request because the server's egress region is not supported. " +
+					"Gemini Code Assist for individuals (free-tier) is only available from a short list of regions; the server's current egress IP falls outside that list. " +
+					"Route upstream traffic through a proxy in a supported region (US/EU/SG) by setting AIHUB_PROXY_URL, or deploy the proxy itself in a supported region.\n\n" +
+					truncate(string(body), 1500),
+				Upstream:  resp.StatusCode,
+				Retryable: false,
+			}
+		case resp.StatusCode == http.StatusForbidden &&
+			antigravityProjectRouteError(body) && !retriedProjectRoute:
+			if ensurer, ok := e.vendor.(antigravityProjectEnsurer); ok {
+				e.log.Info("antigravity: 403 project-route error; refreshing project id and retrying once",
+					"connection", conn.ID, "project", conn.ProjectID, "attempt", attempt)
+				if ensureErr := ensurer.EnsureProjectID(ctx, conn); ensureErr != nil {
+					e.log.Debug("antigravity: project id refresh on 403 failed",
+						"connection", conn.ID, "error", ensureErr)
+				}
+			}
+			retryReason = "403 project-route"
+			retriedProjectRoute = true
+		case resp.StatusCode == http.StatusTooManyRequests &&
+			antigravityTransientRateLimit(body) && !retriedTransient429:
 			// Wait a short backoff. The request context is the one
 			// the client gave us, so honour cancellation but do not
 			// bound the wait on it alone — a 1-second context would
@@ -204,132 +241,87 @@ func (e *antigravityExecutor) send(ctx context.Context, conn *model.Connection, 
 				return nil, asAPIError(model.ProviderAntigravity, ctx.Err())
 			case <-time.After(3 * time.Second):
 			}
-			// Rebuild the envelope (sessionId must be unique per
-			// attempt; otherwise Google dedupes the second request
-			// as a replay of the first).
-			body2, bodyErr := wrapAntigravityRequest(req.Model, conn.ProjectID, inner, opts.Raw)
-			if bodyErr != nil {
-				return nil, asAPIError(model.ProviderAntigravity, bodyErr)
-			}
-			retryReq, retryErr := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body2))
-			if retryErr != nil {
-				return nil, asAPIError(model.ProviderAntigravity, retryErr)
-			}
-			retryReq.Header.Set("Content-Type", "application/json")
-			retryReq.Header.Set("Authorization", "Bearer "+cred.AccessToken)
-			if agent, ok := e.vendor.(userAgentProvider); ok {
-				retryReq.Header.Set("User-Agent", agent.UserAgent(ctx))
-			}
-			if conn.ProjectID != "" {
-				retryReq.Header.Set("X-Goog-User-Project", conn.ProjectID)
-			}
-			if req.Stream {
-				retryReq.Header.Set("Accept", "text/event-stream")
-			} else {
-				retryReq.Header.Set("Accept", "application/json")
-			}
-			if e.debug {
-				e.logDebug("antigravity upstream retry after 429 transient",
-					"connection", conn.ID,
-					"project_id", conn.ProjectID,
-					"request_body", truncateForLog(string(body2), 16*1024),
-				)
-			}
-			retryResp, retryErr := e.client.Do(retryReq)
-			if retryErr != nil {
-				return nil, asAPIError(model.ProviderAntigravity, retryErr)
-			}
-			if retryResp.StatusCode < 200 || retryResp.StatusCode > 299 {
-				defer retryResp.Body.Close()
-				retryBody := readErrorBody(retryResp.Body)
-				if e.debug {
-					e.logDebug("antigravity upstream retry also failed",
-						"connection", conn.ID,
-						"status", retryResp.StatusCode,
-						"error_body", truncateForLog(string(retryBody), 16*1024),
-					)
+			retryReason = "429 transient"
+			retriedTransient429 = true
+		default:
+			// Not retry-able (or already retried this shape):
+			// surface the upstream error. Detect the 403
+			// project-route shape's enable-API console link so
+			// the operator knows to open the GCP console and
+			// click Enable — the proxy already did what it could.
+			if resp.StatusCode == http.StatusForbidden && antigravityProjectRouteError(body) {
+				return nil, &APIError{
+					Status: http.StatusForbidden,
+					Type:   "project_route_error",
+					Code:   "cloud_code_api_disabled",
+					Message: "antigravity: the project Google assigned to this connection (" + conn.ProjectID + ") does not have the Cloud Code API enabled. " +
+						"Open the link the upstream returned and click \"Enable\", then send another request.\n\n" +
+						truncate(string(body), 1500),
+					Upstream:  resp.StatusCode,
+					Retryable: false,
 				}
-				return nil, apiErrorFromResponse(model.ProviderAntigravity,
-					retryResp.StatusCode, retryResp.Header, retryBody)
 			}
-			resp = retryResp
-			opts.RetryedProjectRoute = true
-		} else if resp.StatusCode == http.StatusForbidden &&
-			antigravityProjectRouteError(body) && !opts.RetryedProjectRoute {
-			if ensurer, ok := e.vendor.(antigravityProjectEnsurer); ok {
-				e.log.Info("antigravity: 403 project-route error; refreshing project id and retrying once",
-					"connection", conn.ID, "project", conn.ProjectID)
-				if ensureErr := ensurer.EnsureProjectID(ctx, conn); ensureErr != nil {
-					e.log.Debug("antigravity: project id refresh on 403 failed",
-						"connection", conn.ID, "error", ensureErr)
-				}
-				// Rebuild the envelope with the (possibly) new project id.
-				body2, bodyErr := wrapAntigravityRequest(req.Model, conn.ProjectID, inner, opts.Raw)
-				if bodyErr != nil {
-					return nil, asAPIError(model.ProviderAntigravity, bodyErr)
-				}
-				retryReq, retryErr := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body2))
-				if retryErr != nil {
-					return nil, asAPIError(model.ProviderAntigravity, retryErr)
-				}
-				retryReq.Header.Set("Content-Type", "application/json")
-				retryReq.Header.Set("Authorization", "Bearer "+cred.AccessToken)
-				if agent, ok := e.vendor.(userAgentProvider); ok {
-					retryReq.Header.Set("User-Agent", agent.UserAgent(ctx))
-				}
-				// OmniRoute's sendAntigravityRequest removes
-				// x-goog-user-project on a 403 retry (see
-				// open-sse/executors/antigravity/executeAttempt.ts:366).
-				// Some projects reject the header when the
-				// Cloud Code API is enabled-but-stale, and
-				// dropping it lets Google re-resolve the
-				// project from the access token. The
-				// envelope body still carries the project
-				// id so the upstream knows which project
-				// to bill against when the request lands.
-				// Do NOT set X-Goog-User-Project here.
-				if req.Stream {
-					retryReq.Header.Set("Accept", "text/event-stream")
-				} else {
-					retryReq.Header.Set("Accept", "application/json")
-				}
-
-				retryResp, retryErr := e.client.Do(retryReq)
-				if retryErr != nil {
-					return nil, asAPIError(model.ProviderAntigravity, retryErr)
-				}
-				if retryResp.StatusCode < 200 || retryResp.StatusCode > 299 {
-					// The retry also failed. When it failed with the
-					// same project-route shape, surface the upstream's
-					// enable-API console link verbatim so the operator
-					// knows to open the GCP console and click Enable —
-					// the proxy already did what it could.
-					defer retryResp.Body.Close()
-					retryBody := readErrorBody(retryResp.Body)
-					if antigravityProjectRouteError(retryBody) {
-						return nil, &APIError{
-							Status: http.StatusForbidden,
-							Type:   "project_route_error",
-							Code:   "cloud_code_api_disabled",
-							Message: "antigravity: the project Google assigned to this connection (" + conn.ProjectID + ") does not have the Cloud Code API enabled. " +
-								"The proxy already retried once after re-running loadCodeAssist + onboardUser, but Google returned the same project. " +
-								"Open the link the upstream returned and click \"Enable\", then send another request — the proxy will pick up the change without a restart.\n\n" +
-								truncate(string(retryBody), 1500),
-							Upstream:  retryResp.StatusCode,
-							Retryable: false,
-						}
-					}
-					return nil, apiErrorFromResponse(model.ProviderAntigravity,
-						retryResp.StatusCode, retryResp.Header, retryBody)
-				}
-				// Retry succeeded: replace the original response so the
-				// rest of send() consumes it as if the 403 never happened.
-				resp = retryResp
-				opts.RetryedProjectRoute = true
-			}
-		} else {
-			return nil, apiErrorFromResponse(model.ProviderAntigravity, resp.StatusCode, resp.Header, body)
+			return nil, apiErrorFromResponse(model.ProviderAntigravity,
+				resp.StatusCode, resp.Header, body)
 		}
+
+		// Build the retry request. The envelope is rebuilt with a
+		// fresh sessionId so Google does not dedupe the second
+		// request as a replay of the first.
+		body2, bodyErr := wrapAntigravityRequest(req.Model, conn.ProjectID, inner, opts.Raw)
+		if bodyErr != nil {
+			return nil, asAPIError(model.ProviderAntigravity, bodyErr)
+		}
+		retryReq, retryErr := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body2))
+		if retryErr != nil {
+			return nil, asAPIError(model.ProviderAntigravity, retryErr)
+		}
+		retryReq.Header.Set("Content-Type", "application/json")
+		retryReq.Header.Set("Authorization", "Bearer "+cred.AccessToken)
+		if agent, ok := e.vendor.(userAgentProvider); ok {
+			retryReq.Header.Set("User-Agent", agent.UserAgent(ctx))
+		}
+		// OmniRoute's sendAntigravityRequest removes x-goog-user-project
+		// on a 403 retry (see executeAttempt.ts:366) — some projects
+		// reject that header when the Cloud Code API is enabled-but-
+		// stale, and dropping it lets Google re-resolve the project
+		// from the access token. The 429 transient retry keeps the
+		// header because the project itself is fine; only the per-minute
+		// bucket is full.
+		if retryReason == "429 transient" && conn.ProjectID != "" {
+			retryReq.Header.Set("X-Goog-User-Project", conn.ProjectID)
+		}
+		if req.Stream {
+			retryReq.Header.Set("Accept", "text/event-stream")
+		} else {
+			retryReq.Header.Set("Accept", "application/json")
+		}
+		if e.debug {
+			e.logDebug("antigravity upstream retry",
+				"connection", conn.ID,
+				"reason", retryReason,
+				"attempt", attempt,
+				"project_id", conn.ProjectID,
+				"request_body", truncateForLog(string(body2), 16*1024),
+			)
+		}
+		retryResp, retryErr := e.client.Do(retryReq)
+		if retryErr != nil {
+			return nil, asAPIError(model.ProviderAntigravity, retryErr)
+		}
+		if e.debug {
+			e.logDebug("antigravity upstream retry response status",
+				"connection", conn.ID,
+				"reason", retryReason,
+				"attempt", attempt,
+				"status", retryResp.StatusCode,
+				"content_type", retryResp.Header.Get("Content-Type"),
+			)
+		}
+		// Replace resp so the loop's next iteration (or the
+		// post-loop success path) sees the retry's result.
+		resp = retryResp
+		opts.RetryedProjectRoute = retriedProjectRoute || retriedTransient429
 	}
 
 	stream := &upstreamStream{Header: resp.Header, Body: resp.Body}
@@ -685,4 +677,33 @@ func antigravityQuotaExhausted(loweredBody string) bool {
 		strings.Contains(loweredBody, "daily limit") ||
 		strings.Contains(loweredBody, "exhausted your capacity") ||
 		strings.Contains(loweredBody, "free tier")
+}
+
+// antigravityGeoBlocked reports whether body carries Google's
+// regional-availability refusal ("User location is not supported for
+// the API use", "is not currently available in your location",
+// "UNSUPPORTED_LOCATION", etc.). The Cloud Code backend only offers
+// Gemini Code Assist for individuals (free-tier) from a short list of
+// regions; a server egressing outside that list sees this 403 on
+// every request, regardless of which account is used.
+//
+// OmniRoute classifies this as GEO_BLOCKED in
+// open-sse/services/errorClassifier.ts:127. This binary does the same
+// here so the operator gets a clear "set AIHUB_PROXY_URL" message
+// instead of an opaque 502 or a misleading "Cloud Code API disabled"
+// project-route error.
+func antigravityGeoBlocked(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	text := strings.ToLower(string(body))
+	return strings.Contains(text, "unsupported_location") ||
+		strings.Contains(text, "user location is not supported") ||
+		strings.Contains(text, "location is not supported") ||
+		strings.Contains(text, "not supported for the api use") ||
+		strings.Contains(text, "region is not supported") ||
+		strings.Contains(text, "unsupported location") ||
+		strings.Contains(text, "not available in your location") ||
+		strings.Contains(text, "not available in your region") ||
+		strings.Contains(text, "not currently available in your location")
 }
