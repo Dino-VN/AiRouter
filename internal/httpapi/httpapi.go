@@ -131,6 +131,7 @@ func (s *Server) route(mux *http.ServeMux) {
 	// base URL are separate connection rows grouped by base_url.
 	mux.Handle("GET /api/openai/endpoints", s.user(s.json(s.listOpenAIEndpoints)))
 	mux.Handle("POST /api/openai/endpoints", s.user(s.json(s.createOpenAIEndpoint)))
+	mux.Handle("DELETE /api/openai/endpoints/{base_url}", s.user(s.json(s.deleteOpenAIEndpoint)))
 	mux.Handle("GET /api/openai/endpoints/{base_url}/models", s.user(s.json(s.scanOpenAIModels)))
 	mux.Handle("POST /api/openai/endpoints/{base_url}/keys", s.user(s.json(s.addOpenAIKey)))
 

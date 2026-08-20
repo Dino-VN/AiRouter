@@ -533,6 +533,16 @@ func (r *Router) record(ctx context.Context, call Call, outcome Outcome) {
 
 // AvailableModels lists the models a user can actually reach, given the
 // connections they own and, optionally, the shared pool.
+//
+// For OAuth providers (Codex, Antigravity), the list comes from the
+// built-in catalog filtered by the connection's plan. For OpenAI-
+// compatible endpoints (provider=openai), the list comes from the
+// operator-curated `metadata.models` field — those are the models the
+// operator scanned from the upstream's /v1/models endpoint or entered
+// manually when registering the endpoint. Without this branch the
+// /v1/models API would never show OpenAI-compatible models, so an
+// operator who just registered an endpoint would see "no models
+// available" until they sent a request with the model id hand-typed.
 func (r *Router) AvailableModels(ctx context.Context, user *model.User, allowShared bool) []provider.ModelInfo {
 	conns, err := r.store.ListConnections(ctx, store.ConnectionFilter{
 		OwnerID:       user.ID,
@@ -551,12 +561,43 @@ func (r *Router) AvailableModels(ctx context.Context, user *model.User, allowSha
 		if !conn.Usable(time.Now()) {
 			continue
 		}
+		// Built-in catalog models (Codex + Antigravity). These come
+		// from internal/provider/models.json and are filtered by the
+		// connection's plan/tier.
 		for _, info := range catalog.ForPlan(conn.Provider, conn.Plan) {
 			if seen[info.ID] {
 				continue
 			}
 			seen[info.ID] = true
 			out = append(out, info)
+		}
+		// OpenAI-compatible endpoints carry their model list in
+		// metadata.models (a JSON array of model id strings). The
+		// operator curates this list through the UI's "Scan from API"
+		// button or the "Enter manually" form. Each id becomes a
+		// ModelInfo the /v1/models endpoint advertises, so SDKs that
+		// list models before sending a request see them without the
+		// operator having to hand-type the id in every curl.
+		if conn.Provider == model.ProviderOpenAI {
+			if raw, ok := conn.Metadata["models"].([]any); ok {
+				for _, item := range raw {
+					id, ok := item.(string)
+					if !ok || strings.TrimSpace(id) == "" {
+						continue
+					}
+					id = strings.TrimSpace(id)
+					if seen[id] {
+						continue
+					}
+					seen[id] = true
+					out = append(out, provider.ModelInfo{
+						ID:       id,
+						Provider: model.ProviderOpenAI,
+						OwnedBy:  "openai-compatible",
+						Object:   "model",
+					})
+				}
+			}
 		}
 	}
 	sort.Slice(out, func(a, b int) bool { return out[a].ID < out[b].ID })

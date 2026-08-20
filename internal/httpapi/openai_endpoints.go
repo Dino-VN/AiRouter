@@ -674,3 +674,96 @@ func truncateHTTP(s string, limit int) string {
 	}
 	return s[:limit] + "…"
 }
+
+// deleteOpenAIEndpoint removes every OpenAI-compatible connection row
+// whose metadata.base_url matches the path parameter. A "profile" is
+// the set of all keys against the same base URL, so deleting the
+// profile means deleting all of them — the operator cannot delete a
+// single key from this endpoint (use the existing
+// DELETE /api/connections/{id} for that).
+//
+// The base_url path parameter is URL-decoded by chi, so callers pass
+// the raw https://api.openai.com/v1 (URL-encoded in the path segment).
+// The handler normalises trailing slashes and case-insensitivity the
+// same way listOpenAIEndpoints and addOpenAIKey do, so a profile
+// registered as https://api.openai.com/v1/ can be deleted by passing
+// https://api.openai.com/v1.
+func (s *Server) deleteOpenAIEndpoint(w http.ResponseWriter, r *http.Request) *apiError {
+	caller := callerFrom(r.Context())
+
+	baseURL, apiErr := decodeOpenAIBaseURLParam(r)
+	if apiErr != nil {
+		return apiErr
+	}
+
+	// List every OpenAI connection the caller owns (or every connection
+	// when the caller is an admin with ?all=1) so we can filter by
+	// base_url client-side. The store's BaseURL filter is also available
+	// (ConnectionFilter.BaseURL), but it is case- and trailing-slash
+	// normalised at the SQL level; doing the comparison here keeps the
+	// delete path consistent with listOpenAIEndpoints' grouping logic.
+	filter := store.ConnectionFilter{
+		OwnerID:  caller.User.ID,
+		Provider: model.ProviderOpenAI,
+	}
+	if queryBool(r, "all") {
+		if !caller.User.IsAdmin() {
+			return errorf(http.StatusForbidden, "forbidden", "only an admin can delete every endpoint")
+		}
+		filter.OwnerID = uuid.Nil
+	}
+
+	conns, err := s.store.ListConnections(r.Context(), filter)
+	if err != nil {
+		return storeError(err, "list openai connections")
+	}
+
+	target := normaliseOpenAIBaseURL(&model.Connection{})
+	_ = target
+	// normaliseOpenAIBaseURL takes a *model.Connection, but here we
+	// only have a string. Replicate the normalisation inline: parse
+	// the URL, lower-case the host, strip the trailing slash.
+	parsedBase := baseURL
+	if p, pErr := url.Parse(baseURL); pErr == nil && p.Host != "" {
+		p.Host = strings.ToLower(p.Host)
+		parsedBase = strings.TrimRight(p.String(), "/")
+	}
+
+	deleted := 0
+	for _, conn := range conns {
+		connBase := normaliseOpenAIBaseURL(conn)
+		if connBase == "" {
+			// Fall back to the canonical endpoint so a connection
+			// created without metadata.base_url (rare) still matches
+			// a delete targeted at https://api.openai.com/v1.
+			connBase = "https://api.openai.com/v1"
+		}
+		if connBase != parsedBase {
+			continue
+		}
+		// Ownership: shared connections can only be deleted by an
+		// admin. The filter already scopes to the caller's own
+		// connections when ?all is unset; when ?all is set the caller
+		// is an admin (checked above), so this loop is safe.
+		if conn.Scope == model.ScopeShared && !caller.User.IsAdmin() {
+			return errorf(http.StatusForbidden, "forbidden",
+				"only an admin can delete a shared endpoint")
+		}
+		if delErr := s.store.DeleteConnection(r.Context(), conn.ID); delErr != nil {
+			return storeError(delErr, "delete connection")
+		}
+		deleted++
+	}
+
+	if deleted == 0 {
+		return errorf(http.StatusNotFound, "not_found",
+			"no OpenAI-compatible endpoint matches base_url %q", baseURL)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":       "deleted",
+		"base_url":     baseURL,
+		"deleted_keys": deleted,
+	})
+	return nil
+}

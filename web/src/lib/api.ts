@@ -301,6 +301,10 @@ export const api = {
     list: () => get<{ endpoints: OpenAIEndpoint[] | null }>("/api/openai/endpoints"),
     create: (body: CreateOpenAIEndpointRequest) =>
       post<CreateConnectionResponse>("/api/openai/endpoints", body),
+    remove: (baseURL: string) =>
+      del<{ status: string; base_url: string; deleted_keys: number }>(
+        `/api/openai/endpoints/${encodeURIComponent(baseURL)}`
+      ),
     addKey: (baseURL: string, body: AddOpenAIKeyRequest) =>
       post<CreateConnectionResponse>(
         `/api/openai/endpoints/${encodeURIComponent(baseURL)}/keys`,

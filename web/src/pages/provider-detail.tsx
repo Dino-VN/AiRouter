@@ -654,18 +654,40 @@ function OpenAIProviderDetail() {
                         : " · no model list"}
                     </CardDescription>
                     <CardAction>
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="outline"
-                        onClick={() =>
-                          navigate(
-                            `/providers/openai?base_url=${encodeURIComponent(e.base_url)}`
-                          )
-                        }
-                      >
-                        Open
-                      </Button>
+                      <div className="flex gap-1">
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          onClick={() =>
+                            navigate(
+                              `/providers/openai?base_url=${encodeURIComponent(e.base_url)}`
+                            )
+                          }
+                        >
+                          Open
+                        </Button>
+                        <Button
+                          type="button"
+                          size="icon-sm"
+                          variant="ghost"
+                          aria-label="Delete endpoint"
+                          disabled={action.isBusy(e.base_url)}
+                          onClick={() =>
+                            setConfirmRequest({
+                              title: `Delete ${e.label || e.base_url}?`,
+                              description: `This removes all ${e.key_count} API key(s) registered against this endpoint. The upstream API itself is not affected.`,
+                              confirmLabel: "Delete",
+                              run: async () => {
+                                await api.openai.remove(e.base_url)
+                                reload()
+                              },
+                            })
+                          }
+                        >
+                          <Trash2Icon />
+                        </Button>
+                      </div>
                     </CardAction>
                   </CardHeader>
                   <CardContent className="text-xs text-muted-foreground">
@@ -677,6 +699,8 @@ function OpenAIProviderDetail() {
               ))
             )}
       </div>
+
+      <ConfirmDialog request={confirmRequest} onClose={() => setConfirmRequest(null)} />
     </div>
   )
 }
